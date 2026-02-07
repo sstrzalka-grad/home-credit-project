@@ -1,0 +1,873 @@
+---
+title: "Home Credit Data Preparation"
+subtitle: "IS 6812 Capstone 1"
+author: "Sarah Strzalka"
+date: "2026-02-07"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+---
+
+# Executive Summary {.unnumbered}
+
+This document implements a production-ready data preparation pipeline that transforms raw Home Credit data into model-ready features. The pipeline addresses key data quality issues identified in the exploratory data analysis, engineers 72+ new features based on domain knowledge and EDA findings, and ensures train/test consistency to prevent data leakage. All transformations are computed from training data and applied identically to test data, producing a dataset of 194 features ready for predictive modeling.
+
+# 1. Introduction
+
+## 1.1 Purpose
+
+This data preparation script translates exploratory findings into reusable, production-ready code for the Home Credit Default Risk prediction project. Unlike the exploratory data analysis phase—which emphasized insight discovery—this preparation phase emphasizes **reproducibility, consistency, and data leakage prevention**.
+
+## 1.2 Key Principles
+
+The data preparation pipeline follows these critical principles:
+
+1. **Train/Test Consistency**: All statistics (means, medians, thresholds) are computed from training data only
+2. **No Data Leakage**: Test data is processed using stored parameters from training
+3. **Reproducibility**: Identical transformations produce identical results
+4. **Modularity**: Functions are reusable and composable
+5. **Documentation**: Code is thoroughly commented for maintainability
+
+## 1.3 Pipeline Overview
+
+The pipeline consists of the following major steps:
+
+1. **Data Cleaning**: Handle anomalies and create missing indicators
+2. **Missing Value Imputation**: Fill missing values using training-derived statistics
+3. **Feature Engineering - Demographics**: Age, employment, and time-based features
+4. **Feature Engineering - Financial**: Affordability ratios and risk metrics
+5. **Feature Engineering - Interactions**: Capture non-linear relationships
+6. **Supplementary Data Aggregation**: Bureau, previous applications, and installments
+7. **Train/Test Validation**: Ensure consistent column sets and data types
+
+```{r setup}
+# Load required libraries
+library(tidyverse)    # Data manipulation and visualization
+
+# Set options
+options(scipen = 999)  # Disable scientific notation
+
+# Set seed for reproducibility
+set.seed(42)
+```
+
+# 2. Function Definitions
+
+## 2.1 Data Cleaning Functions
+
+### Clean Employment Anomaly
+
+The value 365243 (~1000 years) in DAYS_EMPLOYED is a placeholder for missing/unemployed status. This function creates an indicator variable and replaces the anomaly with NA.
+
+```{r clean-employment}
+clean_employment_anomaly <- function(df) {
+  df %>%
+    mutate(
+      EMPLOYMENT_ANOMALY = if_else(DAYS_EMPLOYED == 365243, 1, 0),
+      DAYS_EMPLOYED = if_else(DAYS_EMPLOYED == 365243, NA_real_, DAYS_EMPLOYED)
+    )
+}
+```
+
+### Create Missing Data Indicators
+
+Missing data patterns often contain predictive signal. This function creates binary flags for key features where missingness is informative.
+
+```{r missing-indicators}
+create_missing_indicators <- function(df) {
+  
+  # Key features where missingness may be informative
+  key_features <- c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3",
+                    "OWN_CAR_AGE", "OCCUPATION_TYPE", "AMT_GOODS_PRICE",
+                    "AMT_ANNUITY")
+  
+  for (col in key_features) {
+    if (col %in% names(df)) {
+      indicator_name <- paste0(col, "_MISSING")
+      df[[indicator_name]] <- as.integer(is.na(df[[col]]))
+    }
+  }
+  
+  return(df)
+}
+```
+
+### Impute Missing Values
+
+Fills missing values using median (numerical) or mode (categorical). Statistics are computed from training data and stored for consistent application to test data.
+
+```{r impute-missing}
+impute_missing <- function(df, impute_values = NULL, is_train = TRUE) {
+  
+  # Define columns to impute based on EDA findings
+  numeric_cols_to_impute <- c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3",
+                               "AMT_GOODS_PRICE", "AMT_ANNUITY", 
+                               "CNT_FAM_MEMBERS", "DAYS_LAST_PHONE_CHANGE")
+  
+  categorical_cols_to_impute <- c("OCCUPATION_TYPE", "NAME_TYPE_SUITE")
+  
+  if (is_train) {
+    # Compute imputation values from training data
+    impute_values <- list()
+    
+    # Numeric: use median
+    for (col in numeric_cols_to_impute) {
+      if (col %in% names(df)) {
+        impute_values[[col]] <- median(df[[col]], na.rm = TRUE)
+      }
+    }
+    
+    # Categorical: use mode (most frequent value)
+    for (col in categorical_cols_to_impute) {
+      if (col %in% names(df)) {
+        mode_val <- df %>%
+          filter(!is.na(.data[[col]])) %>%
+          count(.data[[col]]) %>%
+          slice_max(n, n = 1) %>%
+          pull(.data[[col]]) %>%
+          first()
+        impute_values[[col]] <- mode_val
+      }
+    }
+  }
+  
+  # Apply imputation values
+  df_imputed <- df
+  for (col in names(impute_values)) {
+    if (col %in% names(df_imputed)) {
+      df_imputed[[col]][is.na(df_imputed[[col]])] <- impute_values[[col]]
+    }
+  }
+  
+  return(list(data = df_imputed, impute_values = impute_values))
+}
+```
+
+## 2.2 Feature Engineering - Demographic Features
+
+Converts day-based features to years and creates age/employment bins based on EDA patterns.
+
+```{r demographic-features}
+engineer_demographic_features <- function(df) {
+  df %>%
+    mutate(
+      # Convert days to years
+      AGE_YEARS = -DAYS_BIRTH / 365,
+      EMPLOYMENT_YEARS = if_else(
+        is.na(DAYS_EMPLOYED), 
+        NA_real_, 
+        -DAYS_EMPLOYED / 365
+      ),
+      
+      # Age bins based on EDA patterns
+      AGE_BIN = cut(
+        AGE_YEARS,
+        breaks = c(-Inf, 25, 35, 45, 55, 65, Inf),
+        labels = c("18-25", "26-35", "36-45", "46-55", "56-65", "65+"),
+        include.lowest = TRUE
+      ),
+      
+      # Employment tenure bins
+      EMPLOYMENT_BIN = cut(
+        EMPLOYMENT_YEARS,
+        breaks = c(-Inf, 1, 3, 5, 10, Inf),
+        labels = c("0-1yr", "1-3yr", "3-5yr", "5-10yr", "10+yr"),
+        include.lowest = TRUE
+      ),
+      
+      # Registration and ID document age (in years)
+      DAYS_REGISTRATION_YEARS = -DAYS_REGISTRATION / 365,
+      DAYS_ID_PUBLISH_YEARS = -DAYS_ID_PUBLISH / 365,
+      
+      # Phone change recency (in years)
+      DAYS_LAST_PHONE_CHANGE_YEARS = -DAYS_LAST_PHONE_CHANGE / 365
+    )
+}
+```
+
+## 2.3 Feature Engineering - Financial Ratios
+
+Engineers affordability and risk ratios based on financial research and lending industry best practices.
+
+```{r financial-ratios}
+engineer_financial_ratios <- function(df) {
+  df %>%
+    mutate(
+      # Core affordability ratios
+      CREDIT_TO_INCOME = AMT_CREDIT / AMT_INCOME_TOTAL,
+      ANNUITY_TO_INCOME = AMT_ANNUITY / AMT_INCOME_TOTAL,
+      
+      # Loan-to-value ratio (credit to goods price)
+      LOAN_TO_VALUE = AMT_CREDIT / AMT_GOODS_PRICE,
+      
+      # Payment burden (annuity as % of credit)
+      PAYMENT_RATE = AMT_ANNUITY / AMT_CREDIT,
+      
+      # Debt service coverage (income to annuity ratio)
+      # Higher values indicate better ability to service debt
+      INCOME_TO_ANNUITY = AMT_INCOME_TOTAL / AMT_ANNUITY,
+      
+      # Goods price to income ratio
+      GOODS_PRICE_TO_INCOME = AMT_GOODS_PRICE / AMT_INCOME_TOTAL,
+      
+      # Credit per family member (relative burden)
+      CREDIT_PER_PERSON = AMT_CREDIT / CNT_FAM_MEMBERS,
+      INCOME_PER_PERSON = AMT_INCOME_TOTAL / CNT_FAM_MEMBERS,
+      
+      # External credit score combinations
+      # Average external score (if available)
+      EXT_SOURCE_MEAN = rowMeans(
+        select(., starts_with("EXT_SOURCE")), 
+        na.rm = TRUE
+      ),
+      
+      # External score weighted average (EXT_SOURCE_2 had strongest signal in EDA)
+      EXT_SOURCE_WEIGHTED = (
+        0.5 * coalesce(EXT_SOURCE_2, 0) +
+        0.25 * coalesce(EXT_SOURCE_1, 0) +
+        0.25 * coalesce(EXT_SOURCE_3, 0)
+      ),
+      
+      # Income type indicators (binary flags for high-risk categories)
+      # Based on EDA: unemployed, maternity leave showed higher default rates
+      HIGH_RISK_INCOME_TYPE = as.integer(
+        NAME_INCOME_TYPE %in% c("Unemployed", "Maternity leave", "Student")
+      ),
+      
+      # Document submission count (proxy for application completeness)
+      DOCUMENT_COUNT = rowSums(select(., starts_with("FLAG_DOCUMENT")), na.rm = TRUE)
+    ) %>%
+    # Cap extreme ratio values to prevent outliers from dominating
+    mutate(
+      CREDIT_TO_INCOME = pmin(CREDIT_TO_INCOME, 50),
+      ANNUITY_TO_INCOME = pmin(ANNUITY_TO_INCOME, 1),
+      LOAN_TO_VALUE = pmin(LOAN_TO_VALUE, 2)
+    )
+}
+```
+
+## 2.4 Feature Engineering - Interaction Terms
+
+Creates interactions between key predictors identified in EDA. Interactions can capture non-linear relationships.
+
+```{r interaction-features}
+engineer_interactions <- function(df) {
+  df %>%
+    mutate(
+      # Age × Income: younger, lower-income applicants may have higher risk
+      AGE_INCOME_INTERACTION = AGE_YEARS * log1p(AMT_INCOME_TOTAL),
+      
+      # Age × Credit-to-Income: young applicants with high debt burden
+      AGE_CREDIT_RATIO_INTERACTION = AGE_YEARS * CREDIT_TO_INCOME,
+      
+      # Employment × Income: employment stability and income level
+      EMPLOYMENT_INCOME_INTERACTION = coalesce(EMPLOYMENT_YEARS, 0) * log1p(AMT_INCOME_TOTAL),
+      
+      # External score × Credit ratio: credit quality and affordability
+      EXT_SOURCE_CREDIT_RATIO = EXT_SOURCE_MEAN * CREDIT_TO_INCOME,
+      
+      # Age squared (capture non-linear age effects observed in EDA)
+      AGE_SQUARED = AGE_YEARS^2
+    )
+}
+```
+
+## 2.5 Supplementary Data Aggregation - Bureau
+
+Summarizes credit bureau history including active credits, debt levels, and overdue amounts.
+
+```{r aggregate-bureau}
+aggregate_bureau_data <- function(bureau_df) {
+  
+  bureau_agg <- bureau_df %>%
+    group_by(SK_ID_CURR) %>%
+    summarise(
+      # Count features
+      BUREAU_CREDIT_COUNT = n(),
+      BUREAU_ACTIVE_COUNT = sum(CREDIT_ACTIVE == "Active", na.rm = TRUE),
+      BUREAU_CLOSED_COUNT = sum(CREDIT_ACTIVE == "Closed", na.rm = TRUE),
+      BUREAU_BAD_DEBT_COUNT = sum(CREDIT_ACTIVE == "Bad debt", na.rm = TRUE),
+      
+      # Debt and credit amounts
+      BUREAU_TOTAL_CREDIT = sum(AMT_CREDIT_SUM, na.rm = TRUE),
+      BUREAU_TOTAL_DEBT = sum(AMT_CREDIT_SUM_DEBT, na.rm = TRUE),
+      BUREAU_MEAN_CREDIT = mean(AMT_CREDIT_SUM, na.rm = TRUE),
+      BUREAU_MAX_CREDIT = max(AMT_CREDIT_SUM, na.rm = TRUE),
+      
+      # Overdue amounts
+      BUREAU_MAX_OVERDUE = suppressWarnings(max(AMT_CREDIT_MAX_OVERDUE, na.rm = TRUE)),
+      BUREAU_TOTAL_OVERDUE = sum(AMT_CREDIT_MAX_OVERDUE, na.rm = TRUE),
+      BUREAU_MEAN_OVERDUE = mean(AMT_CREDIT_MAX_OVERDUE, na.rm = TRUE),
+      
+      # Days since credits opened
+      BUREAU_DAYS_CREDIT_MEAN = mean(DAYS_CREDIT, na.rm = TRUE),
+      BUREAU_DAYS_CREDIT_MAX = suppressWarnings(max(DAYS_CREDIT, na.rm = TRUE)),
+      
+      # Credit type diversity
+      BUREAU_CREDIT_TYPE_COUNT = n_distinct(CREDIT_TYPE, na.rm = TRUE),
+      
+      .groups = "drop"
+    ) %>%
+    mutate(
+      # Derived ratios
+      BUREAU_DEBT_CREDIT_RATIO = BUREAU_TOTAL_DEBT / BUREAU_TOTAL_CREDIT,
+      BUREAU_ACTIVE_RATIO = BUREAU_ACTIVE_COUNT / BUREAU_CREDIT_COUNT,
+      BUREAU_OVERDUE_RATIO = BUREAU_TOTAL_OVERDUE / BUREAU_TOTAL_CREDIT,
+      
+      # Replace Inf and NaN with 0
+      across(where(is.numeric), ~if_else(is.infinite(.) | is.nan(.), 0, .))
+    )
+  
+  return(bureau_agg)
+}
+```
+
+## 2.6 Supplementary Data Aggregation - Previous Applications
+
+Summarizes applicant's history with Home Credit including approval rates, loan amounts, and application patterns.
+
+```{r aggregate-previous}
+aggregate_previous_applications <- function(prev_app_df) {
+  
+  prev_agg <- prev_app_df %>%
+    group_by(SK_ID_CURR) %>%
+    summarise(
+      # Application counts
+      PREV_APP_COUNT = n(),
+      PREV_APPROVED_COUNT = sum(NAME_CONTRACT_STATUS == "Approved", na.rm = TRUE),
+      PREV_REFUSED_COUNT = sum(NAME_CONTRACT_STATUS == "Refused", na.rm = TRUE),
+      PREV_CANCELED_COUNT = sum(NAME_CONTRACT_STATUS == "Canceled", na.rm = TRUE),
+      
+      # Approval rate
+      PREV_APPROVAL_RATE = mean(NAME_CONTRACT_STATUS == "Approved", na.rm = TRUE),
+      
+      # Credit amounts from previous applications
+      PREV_CREDIT_MEAN = mean(AMT_CREDIT, na.rm = TRUE),
+      PREV_CREDIT_MAX = suppressWarnings(max(AMT_CREDIT, na.rm = TRUE)),
+      PREV_CREDIT_SUM = sum(AMT_CREDIT, na.rm = TRUE),
+      
+      # Application amounts (requested)
+      PREV_APPLICATION_MEAN = mean(AMT_APPLICATION, na.rm = TRUE),
+      PREV_APPLICATION_MAX = suppressWarnings(max(AMT_APPLICATION, na.rm = TRUE)),
+      
+      # Down payment
+      PREV_DOWN_PAYMENT_MEAN = mean(AMT_DOWN_PAYMENT, na.rm = TRUE),
+      PREV_DOWN_PAYMENT_MAX = suppressWarnings(max(AMT_DOWN_PAYMENT, na.rm = TRUE)),
+      
+      # Days decision (application processing time)
+      PREV_DAYS_DECISION_MEAN = mean(DAYS_DECISION, na.rm = TRUE),
+      
+      # Product type diversity
+      PREV_PRODUCT_TYPE_COUNT = n_distinct(NAME_PRODUCT_TYPE, na.rm = TRUE),
+      
+      .groups = "drop"
+    ) %>%
+    mutate(
+      # Derived features
+      # Ratio of approved credit to requested amount
+      PREV_CREDIT_TO_APP_RATIO = PREV_CREDIT_MEAN / PREV_APPLICATION_MEAN,
+      
+      # Replace Inf and NaN with 0
+      across(where(is.numeric), ~if_else(is.infinite(.) | is.nan(.), 0, .))
+    )
+  
+  return(prev_agg)
+}
+```
+
+## 2.7 Supplementary Data Aggregation - Installments
+
+Calculates payment behavior metrics including late payments, payment amounts relative to expected, and payment consistency.
+
+```{r aggregate-installments}
+aggregate_installments <- function(install_df) {
+  
+  # First aggregate to previous application level, then to applicant level
+  install_prev <- install_df %>%
+    mutate(
+      # Calculate payment differences
+      PAYMENT_DIFF = AMT_PAYMENT - AMT_INSTALMENT,
+      PAYMENT_RATIO = AMT_PAYMENT / AMT_INSTALMENT,
+      
+      # Late payment indicator (paid less than expected)
+      LATE_PAYMENT = as.integer(AMT_PAYMENT < AMT_INSTALMENT),
+      
+      # Days past due (positive means late)
+      DAYS_PAST_DUE = DAYS_ENTRY_PAYMENT - DAYS_INSTALMENT
+    ) %>%
+    group_by(SK_ID_PREV) %>%
+    summarise(
+      INSTALL_COUNT = n(),
+      INSTALL_LATE_COUNT = sum(LATE_PAYMENT, na.rm = TRUE),
+      INSTALL_LATE_RATE = mean(LATE_PAYMENT, na.rm = TRUE),
+      
+      INSTALL_PAYMENT_DIFF_MEAN = mean(PAYMENT_DIFF, na.rm = TRUE),
+      INSTALL_PAYMENT_DIFF_SUM = sum(PAYMENT_DIFF, na.rm = TRUE),
+      
+      INSTALL_DAYS_PAST_DUE_MEAN = mean(DAYS_PAST_DUE, na.rm = TRUE),
+      INSTALL_DAYS_PAST_DUE_MAX = suppressWarnings(max(DAYS_PAST_DUE, na.rm = TRUE)),
+      
+      .groups = "drop"
+    )
+  
+  return(install_prev)
+}
+
+aggregate_installments_to_applicant <- function(install_agg, prev_app_df) {
+  
+  # Map SK_ID_PREV to SK_ID_CURR
+  prev_mapping <- prev_app_df %>%
+    select(SK_ID_PREV, SK_ID_CURR)
+  
+  install_applicant <- install_agg %>%
+    left_join(prev_mapping, by = "SK_ID_PREV") %>%
+    group_by(SK_ID_CURR) %>%
+    summarise(
+      INSTALL_LOANS_COUNT = n(),
+      INSTALL_TOTAL_COUNT = sum(INSTALL_COUNT, na.rm = TRUE),
+      INSTALL_LATE_TOTAL = sum(INSTALL_LATE_COUNT, na.rm = TRUE),
+      INSTALL_LATE_RATE_MEAN = mean(INSTALL_LATE_RATE, na.rm = TRUE),
+      INSTALL_DAYS_PAST_DUE_MEAN = mean(INSTALL_DAYS_PAST_DUE_MEAN, na.rm = TRUE),
+      INSTALL_DAYS_PAST_DUE_MAX = suppressWarnings(max(INSTALL_DAYS_PAST_DUE_MAX, na.rm = TRUE)),
+      INSTALL_PAYMENT_DIFF_TOTAL = sum(INSTALL_PAYMENT_DIFF_SUM, na.rm = TRUE),
+      
+      .groups = "drop"
+    ) %>%
+    mutate(
+      # Overall late payment rate across all previous loans
+      INSTALL_LATE_RATE_OVERALL = INSTALL_LATE_TOTAL / INSTALL_TOTAL_COUNT,
+      
+      # Replace Inf and NaN
+      across(where(is.numeric), ~if_else(is.infinite(.) | is.nan(.), 0, .))
+    )
+  
+  return(install_applicant)
+}
+```
+
+## 2.8 Main Pipeline Function
+
+Main function that orchestrates all data preparation steps in the correct order. Ensures train/test consistency by storing and reusing statistics.
+
+```{r main-pipeline}
+prepare_data <- function(app_data, 
+                        bureau_data = NULL,
+                        prev_app_data = NULL, 
+                        install_data = NULL,
+                        is_train = TRUE,
+                        prep_params = NULL) {
+  
+  cat("Starting data preparation pipeline...\n")
+  
+  # Step 1: Clean application data
+  cat("Step 1: Cleaning application data...\n")
+  app_clean <- app_data %>%
+    clean_employment_anomaly() %>%
+    create_missing_indicators()
+  
+  # Step 2: Impute missing values
+  cat("Step 2: Imputing missing values...\n")
+  if (is_train) {
+    impute_result <- impute_missing(app_clean, is_train = TRUE)
+    app_clean <- impute_result$data
+    impute_values <- impute_result$impute_values
+  } else {
+    impute_result <- impute_missing(app_clean, 
+                                    impute_values = prep_params$impute_values, 
+                                    is_train = FALSE)
+    app_clean <- impute_result$data
+    impute_values <- prep_params$impute_values
+  }
+  
+  # Step 3: Engineer features
+  cat("Step 3: Engineering features...\n")
+  app_features <- app_clean %>%
+    engineer_demographic_features() %>%
+    engineer_financial_ratios() %>%
+    engineer_interactions()
+  
+  # Step 4: Aggregate supplementary data
+  final_data <- app_features
+  
+  if (!is.null(bureau_data)) {
+    cat("Step 4a: Aggregating bureau data...\n")
+    bureau_agg <- aggregate_bureau_data(bureau_data)
+    final_data <- final_data %>%
+      left_join(bureau_agg, by = "SK_ID_CURR")
+  }
+  
+  if (!is.null(prev_app_data)) {
+    cat("Step 4b: Aggregating previous application data...\n")
+    prev_agg <- aggregate_previous_applications(prev_app_data)
+    final_data <- final_data %>%
+      left_join(prev_agg, by = "SK_ID_CURR")
+  }
+  
+  if (!is.null(install_data) && !is.null(prev_app_data)) {
+    cat("Step 4c: Aggregating installment payment data...\n")
+    install_prev_agg <- aggregate_installments(install_data)
+    install_agg <- aggregate_installments_to_applicant(install_prev_agg, prev_app_data)
+    final_data <- final_data %>%
+      left_join(install_agg, by = "SK_ID_CURR")
+  }
+  
+  # Step 5: Fill NAs in aggregated features
+  cat("Step 5: Handling missing values in aggregated features...\n")
+  supplementary_features <- c(
+    names(final_data)[grepl("^BUREAU_", names(final_data))],
+    names(final_data)[grepl("^PREV_", names(final_data))],
+    names(final_data)[grepl("^INSTALL_", names(final_data))]
+  )
+  
+  final_data <- final_data %>%
+    mutate(across(all_of(supplementary_features), ~coalesce(., 0)))
+  
+  # Step 6: Store parameters for test data consistency
+  if (is_train) {
+    prep_params <- list(
+      impute_values = impute_values,
+      feature_names = names(final_data)
+    )
+  } else {
+    # Ensure test data has same columns as train (except TARGET)
+    train_features <- setdiff(prep_params$feature_names, "TARGET")
+    test_features <- names(final_data)
+    
+    missing_cols <- setdiff(train_features, test_features)
+    if (length(missing_cols) > 0) {
+      cat("Adding missing columns to test data:", paste(missing_cols, collapse = ", "), "\n")
+      for (col in missing_cols) {
+        final_data[[col]] <- 0
+      }
+    }
+    
+    if ("TARGET" %in% names(final_data)) {
+      final_data <- final_data %>%
+        select(all_of(c(train_features, "TARGET")))
+    } else {
+      final_data <- final_data %>%
+        select(all_of(train_features))
+    }
+  }
+  
+  cat("Data preparation complete!\n")
+  cat("Final dataset dimensions:", nrow(final_data), "rows ×", ncol(final_data), "columns\n")
+  
+  return(list(
+    data = final_data,
+    params = prep_params
+  ))
+}
+```
+
+## 2.9 Helper Functions
+
+```{r helper-functions}
+# Load all data files
+load_all_data <- function(data_dir = "Data") {
+  cat("Loading data files from:", data_dir, "\n")
+  
+  data_list <- list(
+    app_train = read_csv(file.path(data_dir, "application_train.csv"), 
+                        show_col_types = FALSE),
+    app_test = read_csv(file.path(data_dir, "application_test.csv"), 
+                       show_col_types = FALSE),
+    bureau = read_csv(file.path(data_dir, "bureau.csv"), 
+                     show_col_types = FALSE),
+    prev_app = read_csv(file.path(data_dir, "previous_application.csv"), 
+                       show_col_types = FALSE),
+    installments = read_csv(file.path(data_dir, "installments_payments.csv"), 
+                           show_col_types = FALSE)
+  )
+  
+  cat("Data loading complete!\n")
+  return(data_list)
+}
+
+# Save prepared data
+save_prepared_data <- function(train_result, test_result = NULL, output_dir = "prepared_data") {
+  
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  cat("Saving prepared training data...\n")
+  write_csv(train_result$data, file.path(output_dir, "train_prepared.csv"))
+  saveRDS(train_result$params, file.path(output_dir, "prep_params.rds"))
+  
+  if (!is.null(test_result)) {
+    cat("Saving prepared test data...\n")
+    write_csv(test_result$data, file.path(output_dir, "test_prepared.csv"))
+  }
+  
+  cat("Files saved to:", output_dir, "\n")
+}
+```
+
+# 3. Data Preparation Execution
+
+## 3.1 Load Raw Data
+
+```{r load-data}
+# Load all data files
+data <- load_all_data("Data")
+
+# Display dimensions
+cat("\nData loaded successfully!\n")
+cat("- Application train:", nrow(data$app_train), "rows ×", ncol(data$app_train), "columns\n")
+cat("- Application test:", nrow(data$app_test), "rows ×", ncol(data$app_test), "columns\n")
+cat("- Bureau:", nrow(data$bureau), "rows ×", ncol(data$bureau), "columns\n")
+cat("- Previous applications:", nrow(data$prev_app), "rows ×", ncol(data$prev_app), "columns\n")
+cat("- Installments:", nrow(data$installments), "rows ×", ncol(data$installments), "columns\n")
+```
+
+## 3.2 Prepare Training Data
+
+```{r prepare-train}
+# Prepare training data with all supplementary tables
+train_result <- prepare_data(
+  app_data = data$app_train,
+  bureau_data = data$bureau,
+  prev_app_data = data$prev_app,
+  install_data = data$installments,
+  is_train = TRUE
+)
+
+# Access prepared training data
+train_prepared <- train_result$data
+
+# Display summary
+cat("\n=== Training Data Summary ===\n")
+cat("Dimensions:", nrow(train_prepared), "rows ×", ncol(train_prepared), "columns\n")
+cat("Features added:", ncol(train_prepared) - ncol(data$app_train), "\n")
+```
+
+## 3.3 Prepare Test Data
+
+```{r prepare-test}
+# Prepare test data using training parameters (NO DATA LEAKAGE!)
+test_result <- prepare_data(
+  app_data = data$app_test,
+  bureau_data = data$bureau,
+  prev_app_data = data$prev_app,
+  install_data = data$installments,
+  is_train = FALSE,
+  prep_params = train_result$params  # Use parameters from training!
+)
+
+# Access prepared test data
+test_prepared <- test_result$data
+
+# Display summary
+cat("\n=== Test Data Summary ===\n")
+cat("Dimensions:", nrow(test_prepared), "rows ×", ncol(test_prepared), "columns\n")
+```
+
+## 3.4 Verify Train/Test Consistency
+
+```{r verify-consistency}
+cat("\n=== Train/Test Consistency Check ===\n\n")
+
+train_cols <- names(train_prepared)
+test_cols <- names(test_prepared)
+
+cat("Training columns:", length(train_cols), "\n")
+cat("Test columns:", length(test_cols), "\n\n")
+
+# Check column consistency
+train_features <- setdiff(train_cols, "TARGET")
+test_features <- test_cols
+
+missing_in_test <- setdiff(train_features, test_features)
+extra_in_test <- setdiff(test_features, train_features)
+
+if (length(missing_in_test) == 0 && length(extra_in_test) == 0) {
+  cat("✅ Column consistency: PASS - All features match!\n\n")
+} else {
+  cat("⚠️ Column consistency issues detected\n")
+}
+
+# Verify TARGET variable
+cat("TARGET variable:\n")
+cat("- In training data:", "TARGET" %in% names(train_prepared), "\n")
+cat("- In test data:", "TARGET" %in% names(test_prepared), "\n\n")
+
+# Display stored imputation values
+cat("Imputation values stored for", length(train_result$params$impute_values), "columns:\n")
+for (col in names(train_result$params$impute_values)) {
+  cat("-", col, ":", train_result$params$impute_values[[col]], "\n")
+}
+```
+
+# 4. Feature Summary
+
+## 4.1 Engineered Features by Category
+
+```{r feature-summary}
+# Categorize features
+all_features <- names(train_prepared)
+
+feature_categories <- tibble(
+  Category = c(
+    "Original Features",
+    "Demographic Features",
+    "Financial Ratios",
+    "Bureau Aggregations",
+    "Previous App Aggregations",
+    "Installment Aggregations",
+    "Missing Indicators",
+    "Interaction Terms"
+  ),
+  Count = c(
+    ncol(data$app_train),
+    sum(grepl("AGE_|EMPLOYMENT_", all_features)),
+    sum(grepl("_TO_|_PER_|_RATE|PAYMENT_RATE|LOAN_TO_VALUE", all_features)),
+    sum(grepl("^BUREAU_", all_features)),
+    sum(grepl("^PREV_", all_features)),
+    sum(grepl("^INSTALL_", all_features)),
+    sum(grepl("_MISSING$", all_features)),
+    sum(grepl("INTERACTION|SQUARED", all_features))
+  )
+)
+
+feature_categories %>%
+  mutate(
+    Percentage = scales::percent(Count / sum(Count), accuracy = 0.1)
+  ) %>%
+  knitr::kable()
+
+cat("\nTotal features in prepared dataset:", ncol(train_prepared), "\n")
+cat("Features added:", ncol(train_prepared) - ncol(data$app_train), "\n")
+```
+
+## 4.2 Sample of Engineered Features
+
+```{r feature-sample}
+# Display sample of key engineered features
+train_prepared %>%
+  select(
+    SK_ID_CURR, TARGET,
+    AGE_YEARS, EMPLOYMENT_YEARS, EMPLOYMENT_ANOMALY,
+    CREDIT_TO_INCOME, ANNUITY_TO_INCOME,
+    EXT_SOURCE_MEAN, EXT_SOURCE_WEIGHTED,
+    BUREAU_CREDIT_COUNT, PREV_APP_COUNT, INSTALL_LOANS_COUNT
+  ) %>%
+  head(10)
+```
+
+## 4.3 Missing Value Rates in Final Data
+
+```{r missing-final}
+# Check missing values in key features
+missing_rates <- train_prepared %>%
+  summarise(
+    across(
+      c(EXT_SOURCE_1, EXT_SOURCE_2, EXT_SOURCE_3, AGE_YEARS, 
+        EMPLOYMENT_YEARS, CREDIT_TO_INCOME, AMT_GOODS_PRICE),
+      ~mean(is.na(.))
+    )
+  ) %>%
+  pivot_longer(everything(), names_to = "Feature", values_to = "Missing_Rate") %>%
+  mutate(Missing_Rate = scales::percent(Missing_Rate, accuracy = 0.1))
+
+missing_rates %>%
+  knitr::kable()
+```
+
+# 5. Data Quality Checks
+
+## 5.1 Check for Infinite Values
+
+```{r check-infinite}
+# Check for infinite values in numeric columns
+inf_check <- train_prepared %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), ~sum(is.infinite(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "inf_count") %>%
+  filter(inf_count > 0)
+
+if (nrow(inf_check) == 0) {
+  cat("✅ No infinite values found in prepared data\n")
+} else {
+  cat("⚠️ Infinite values detected:\n")
+  print(inf_check)
+}
+```
+
+## 5.2 Summary Statistics for Key Features
+
+```{r summary-stats}
+# Summary statistics for key engineered features
+train_prepared %>%
+  select(
+    AGE_YEARS, EMPLOYMENT_YEARS,
+    CREDIT_TO_INCOME, ANNUITY_TO_INCOME,
+    EXT_SOURCE_MEAN, BUREAU_CREDIT_COUNT,
+    PREV_APP_COUNT, INSTALL_LOANS_COUNT
+  ) %>%
+  summary()
+```
+
+# 6. Save Prepared Data
+
+```{r save-data}
+# Save prepared datasets to disk
+save_prepared_data(train_result, test_result, output_dir = "prepared_data")
+
+cat("\n✅ Data preparation complete!\n")
+cat("Prepared datasets saved to 'prepared_data/' directory\n")
+```
+
+# 7. Conclusion
+
+## 7.1 Summary of Transformations
+
+This data preparation pipeline successfully transformed raw Home Credit data into a model-ready dataset through the following steps:
+
+1. **Data Cleaning**: Handled 365,243 employment anomaly affecting 18% of records, created 7 missing data indicators
+2. **Missing Value Imputation**: Imputed 9 features using training-derived medians and modes
+3. **Demographic Engineering**: Created 10 time-based features including age bins and employment tenure
+4. **Financial Engineering**: Generated 15+ affordability ratios and risk metrics
+5. **Interaction Engineering**: Built 5 interaction terms to capture non-linear relationships
+6. **Bureau Aggregation**: Summarized credit history into 17 features covering debt, overdues, and credit diversity
+7. **Previous Application Aggregation**: Condensed application history into 15 features including approval rates
+8. **Installment Aggregation**: Calculated 8 payment behavior metrics including late payment rates
+
+## 7.2 Final Dataset Characteristics
+
+- **Training data**: 307,511 rows × 194 columns (including TARGET)
+- **Test data**: 48,744 rows × 193 columns (excluding TARGET)
+- **Features added**: 72 new features engineered
+- **Train/test consistency**: Verified - all features match except TARGET
+- **Data quality**: No infinite values, appropriate missing value handling
+
+## 7.3 Key Design Decisions
+
+1. **No Data Leakage**: All statistics computed from training data only, stored in `prep_params`, and reused for test data
+2. **Structural Missingness**: Recognized that many missing values are informative (e.g., no car = missing OWN_CAR_AGE)
+3. **Outlier Capping**: Limited extreme ratios (e.g., CREDIT_TO_INCOME capped at 50) to prevent outlier dominance
+4. **Zero Filling**: Replaced NA in aggregated features with 0 for applicants without supplementary data
+5. **Feature Naming**: Used consistent prefixes (BUREAU_, PREV_, INSTALL_) for easy feature selection
+
+## 7.4 Next Steps
+
+The prepared datasets are now ready for:
+
+1. **Exploratory visualization** of engineered features
+2. **Feature selection** using correlation analysis or importance metrics
+3. **Model development** using classification algorithms (logistic regression, random forest, XGBoost)
+4. **Model evaluation** using ROC-AUC and other performance metrics
+5. **Model interpretation** to identify key drivers of default risk
+
+# 8. Use of AI
+
+AI tools were used throughout this data preparation process to help generate code structure, suggest best practices for handling missing data, and provide recommendations for financial ratio calculations. All code was reviewed, tested, and validated to ensure correctness and alignment with the project objectives. The final pipeline reflects a combination of AI-generated suggestions, domain knowledge, and findings from the exploratory data analysis.
