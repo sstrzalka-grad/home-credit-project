@@ -1,0 +1,603 @@
+---
+title: "Home Credit Model Card"
+subtitle: "IS 6812 Capstone 1"
+author: "Sarah Strzalka"
+date: "2026-03-30"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(caret)
+library(pROC)
+library(xgboost)
+library(knitr)
+library(scales)
+
+options(scipen = 999)
+theme_set(theme_minimal(base_size = 12))
+set.seed(42)
+
+cv_folds <- 2
+xgb_sample_size <- 10000
+shap_sample_size <- 1000
+
+prepare_model_frame <- function(data, target_col = "TARGET") {
+  char_cols <- sapply(data, is.character)
+  data[char_cols] <- lapply(data[char_cols], factor)
+
+  nzv_cols <- sapply(data, function(x) length(unique(x)) <= 1)
+  nzv_cols[target_col] <- FALSE
+  dropped <- names(data)[nzv_cols]
+
+  data <- data[, !nzv_cols, drop = FALSE]
+
+  list(data = data, dropped = dropped)
+}
+
+safe_sample_n <- function(data, n, seed = 42) {
+  set.seed(seed)
+  dplyr::slice_sample(data, n = min(n, nrow(data)))
+}
+
+build_pos_features <- function(path) {
+  read_csv(path, show_col_types = FALSE) %>%
+    group_by(SK_ID_CURR) %>%
+    summarise(
+      POS_MONTHS_BALANCE = n(),
+      POS_CNT_INSTALMENT_MEAN = mean(CNT_INSTALMENT, na.rm = TRUE),
+      POS_SK_DPD_MEAN = mean(SK_DPD, na.rm = TRUE),
+      POS_SK_DPD_MAX = max(SK_DPD, na.rm = TRUE),
+      POS_COMPLETED_RATIO = mean(NAME_CONTRACT_STATUS == "Completed", na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+build_cc_features <- function(path) {
+  read_csv(path, show_col_types = FALSE) %>%
+    group_by(SK_ID_CURR) %>%
+    summarise(
+      CC_MONTHS_BALANCE = n(),
+      CC_AMT_BALANCE_MEAN = mean(AMT_BALANCE, na.rm = TRUE),
+      CC_AMT_DRAWINGS_MEAN = mean(AMT_DRAWINGS_CURRENT, na.rm = TRUE),
+      CC_SK_DPD_MEAN = mean(SK_DPD, na.rm = TRUE),
+      CC_SK_DPD_MAX = max(SK_DPD, na.rm = TRUE),
+      CC_UTILIZATION_MEAN = mean(AMT_BALANCE / (AMT_CREDIT_LIMIT_ACTUAL + 1), na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+fit_final_model_bundle <- function() {
+  train_data <- read_csv("prepared_data/train_prepared.csv", show_col_types = FALSE)
+  pos_features <- build_pos_features("Data/POS_CASH_balance.csv")
+  cc_features <- build_cc_features("Data/credit_card_balance.csv")
+
+  model_data_with_id <- train_data %>%
+    mutate(TARGET = factor(ifelse(TARGET == 1, "Default", "NoDefault"),
+                           levels = c("NoDefault", "Default"))) %>%
+    left_join(pos_features, by = "SK_ID_CURR") %>%
+    left_join(cc_features, by = "SK_ID_CURR")
+
+  new_cols <- c(names(pos_features)[-1], names(cc_features)[-1])
+  model_data_with_id[new_cols] <- lapply(
+    model_data_with_id[new_cols],
+    function(x) replace(x, is.na(x), 0)
+  )
+
+  model_data_enhanced <- model_data_with_id %>%
+    select(-SK_ID_CURR) %>%
+    na.omit()
+
+  prepared <- prepare_model_frame(model_data_enhanced)
+  model_data_enhanced <- prepared$data
+
+  enhanced_sample <- safe_sample_n(model_data_enhanced, xgb_sample_size) %>%
+    mutate(.row_id = row_number())
+
+  train_df <- enhanced_sample %>% select(-.row_id)
+
+  train_control <- trainControl(
+    method = "cv",
+    number = cv_folds,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final",
+    verboseIter = FALSE
+  )
+
+  xgb_grid <- expand.grid(
+    nrounds = 50,
+    max_depth = 3,
+    eta = 0.1,
+    gamma = 0,
+    colsample_bytree = 0.8,
+    min_child_weight = 1,
+    subsample = 0.8
+  )
+
+  final_model <- train(
+    TARGET ~ .,
+    data = train_df,
+    method = "xgbTree",
+    trControl = train_control,
+    metric = "ROC",
+    tuneGrid = xgb_grid,
+    verbosity = 0
+  )
+
+  list(
+    final_model = final_model,
+    training_data = enhanced_sample,
+    xgb_grid = xgb_grid,
+    dropped_columns = prepared$dropped
+  )
+}
+
+amortized_interest <- function(principal, apr, months) {
+  monthly_rate <- apr / 12
+  payment <- principal * (monthly_rate * (1 + monthly_rate)^months) /
+    ((1 + monthly_rate)^months - 1)
+  payment * months - principal
+}
+
+align_model_matrix <- function(model, data) {
+  mm <- model.matrix(~ . - 1, data = data)
+  required_features <- model$finalModel$feature_names
+
+  missing_features <- setdiff(required_features, colnames(mm))
+  if (length(missing_features) > 0) {
+    zero_block <- matrix(0, nrow = nrow(mm), ncol = length(missing_features))
+    colnames(zero_block) <- missing_features
+    mm <- cbind(mm, zero_block)
+  }
+
+  extra_features <- setdiff(colnames(mm), required_features)
+  if (length(extra_features) > 0) {
+    mm <- mm[, !colnames(mm) %in% extra_features, drop = FALSE]
+  }
+
+  mm[, required_features, drop = FALSE]
+}
+
+metric_summary <- function(actual, score, threshold) {
+  pred_default <- ifelse(score >= threshold, "Default", "NoDefault")
+  actual_default <- actual == "Default"
+  pred_default_flag <- pred_default == "Default"
+
+  tp <- sum(pred_default_flag & actual_default)
+  fp <- sum(pred_default_flag & !actual_default)
+  fn <- sum(!pred_default_flag & actual_default)
+  tn <- sum(!pred_default_flag & !actual_default)
+
+  tibble(
+    Precision = ifelse(tp + fp == 0, NA_real_, tp / (tp + fp)),
+    Recall = ifelse(tp + fn == 0, NA_real_, tp / (tp + fn)),
+    Specificity = ifelse(tn + fp == 0, NA_real_, tn / (tn + fp)),
+    ApprovalRate = mean(!pred_default_flag)
+  )
+}
+
+feature_reason <- function(feature) {
+  case_when(
+    str_detect(feature, "^EXT_SOURCE_1") ~ "Limited or weak external credit history signal from bureau source 1.",
+    str_detect(feature, "^EXT_SOURCE_2") ~ "Limited or weak external credit history signal from bureau source 2.",
+    str_detect(feature, "^EXT_SOURCE_3") ~ "Limited or weak external credit history signal from bureau source 3.",
+    str_detect(feature, "CREDIT_TO_INCOME") ~ "Requested credit is high relative to stated income.",
+    str_detect(feature, "ANNUITY_TO_INCOME") ~ "Monthly payment burden appears high relative to income.",
+    str_detect(feature, "AGE_YEARS") ~ "Applicant is in a younger age band that historically showed higher default risk.",
+    str_detect(feature, "EMPLOYMENT_YEARS") ~ "Employment history is shorter than that of lower-risk borrowers.",
+    str_detect(feature, "^BUREAU_") ~ "Prior external credit behavior increased predicted repayment risk.",
+    str_detect(feature, "^PREV_") ~ "Past Home Credit application history increased predicted repayment risk.",
+    str_detect(feature, "^INSTALL_") ~ "Installment payment history indicates weaker repayment performance.",
+    str_detect(feature, "^POS_") ~ "Point-of-sale or cash-loan repayment history indicates elevated delinquency risk.",
+    str_detect(feature, "^CC_") ~ "Credit-card repayment or utilization behavior indicates elevated risk.",
+    str_detect(feature, "INCOME") ~ "Income profile appears weaker relative to the amount requested.",
+    str_detect(feature, "DAYS_EMPLOYED_ANOMALY") ~ "Employment information was incomplete or anomalous in bureau-style records.",
+    str_detect(feature, "NAME_EDUCATION_TYPE") ~ "Education profile differs from the lower-risk pattern in training data.",
+    str_detect(feature, "CODE_GENDER") ~ "Protected demographic field influenced the score; this should not be used as a denial reason in production.",
+    TRUE ~ "Historical repayment data associated this feature with higher default risk."
+  )
+}
+
+model_path <- "models/final_model_sstrzalka.rds"
+dir.create("models", showWarnings = FALSE)
+
+if (file.exists(model_path)) {
+  model_bundle <- readRDS(model_path)
+} else {
+  model_bundle <- fit_final_model_bundle()
+  saveRDS(model_bundle, model_path)
+}
+
+final_model <- model_bundle$final_model
+training_data <- model_bundle$training_data
+xgb_grid <- model_bundle$xgb_grid
+
+oof_predictions <- final_model$pred %>%
+  transmute(
+    rowIndex,
+    obs,
+    prob_default = Default
+  ) %>%
+  left_join(
+    training_data %>%
+      transmute(
+        rowIndex = .row_id,
+        CODE_GENDER,
+        NAME_EDUCATION_TYPE
+      ),
+    by = "rowIndex"
+  )
+
+cv_auc <- as.numeric(
+  auc(
+    roc(
+      response = oof_predictions$obs,
+      predictor = oof_predictions$prob_default,
+      levels = c("NoDefault", "Default"),
+      quiet = TRUE
+    )
+  )
+)
+
+kaggle_public_auc <- 0.73565
+kaggle_private_auc <- 0.72370
+
+apr_24m <- 0.1114
+avg_loan_balance <- 11699
+loan_term_months <- 24
+recovery_rate <- 0.15
+profit_if_repaid <- amortized_interest(avg_loan_balance, apr_24m, loan_term_months)
+loss_if_default <- avg_loan_balance * (1 - recovery_rate)
+break_even_threshold <- profit_if_repaid / (profit_if_repaid + loss_if_default)
+
+threshold_grid <- tibble(threshold = seq(0.03, 0.30, by = 0.01)) %>%
+  mutate(threshold = round(threshold, 2)) %>%
+  mutate(
+    decision = map(
+      threshold,
+      ~ {
+        predicted_default <- oof_predictions$prob_default >= .x
+        actual_default <- oof_predictions$obs == "Default"
+
+        approved <- !predicted_default
+        value <- ifelse(
+          approved & !actual_default, profit_if_repaid,
+          ifelse(approved & actual_default, -loss_if_default, 0)
+        )
+
+        tibble(
+          approval_rate = mean(approved),
+          precision = ifelse(sum(predicted_default) == 0, NA_real_,
+                             sum(predicted_default & actual_default) / sum(predicted_default)),
+          recall = sum(predicted_default & actual_default) / sum(actual_default),
+          value_per_application = mean(value),
+          value_per_1000 = mean(value) * 1000
+        )
+      }
+    )
+  ) %>%
+  unnest(decision)
+
+optimal_threshold <- threshold_grid %>%
+  slice_max(order_by = value_per_application, n = 1, with_ties = FALSE) %>%
+  pull(threshold)
+
+threshold_metrics <- metric_summary(
+  actual = oof_predictions$obs,
+  score = oof_predictions$prob_default,
+  threshold = optimal_threshold
+)
+
+performance_table <- tibble(
+  Metric = c(
+    "Cross-validated AUC",
+    "Kaggle public AUC",
+    "Kaggle private AUC",
+    "Precision at operating threshold",
+    "Recall at operating threshold",
+    "Specificity at operating threshold",
+    "Approval rate at operating threshold"
+  ),
+  Value = c(
+    number(cv_auc, accuracy = 0.0001),
+    number(kaggle_public_auc, accuracy = 0.0001),
+    number(kaggle_private_auc, accuracy = 0.0001),
+    percent(threshold_metrics$Precision, accuracy = 0.1),
+    percent(threshold_metrics$Recall, accuracy = 0.1),
+    percent(threshold_metrics$Specificity, accuracy = 0.1),
+    percent(threshold_metrics$ApprovalRate, accuracy = 0.1)
+  )
+)
+
+threshold_scenarios <- threshold_grid %>%
+  filter(threshold %in% c(0.05, 0.10, 0.12, 0.15, 0.20, 0.25)) %>%
+  mutate(
+    approval_rate = percent(approval_rate, accuracy = 0.1),
+    precision = percent(precision, accuracy = 0.1),
+    recall = percent(recall, accuracy = 0.1),
+    value_per_1000 = dollar(value_per_1000, accuracy = 1)
+  ) %>%
+  select(threshold, approval_rate, precision, recall, value_per_1000)
+
+shap_sample <- training_data %>%
+  select(-.row_id) %>%
+  safe_sample_n(shap_sample_size)
+
+shap_matrix <- align_model_matrix(final_model, shap_sample %>% select(-TARGET))
+shap_values <- predict(final_model$finalModel, newdata = shap_matrix, predcontrib = TRUE)
+shap_values <- as_tibble(shap_values)
+
+if ("BIAS" %in% names(shap_values)) {
+  shap_values <- select(shap_values, -BIAS)
+}
+
+shap_importance <- tibble(
+  feature = names(shap_values),
+  mean_abs_shap = map_dbl(shap_values, ~ mean(abs(.x), na.rm = TRUE))
+) %>%
+  arrange(desc(mean_abs_shap))
+
+top_shap_features <- shap_importance %>%
+  slice_head(n = 10)
+
+adverse_action_table <- top_shap_features %>%
+  filter(!str_detect(feature, "CODE_GENDER")) %>%
+  slice_head(n = 6) %>%
+  mutate(
+    denial_reason = map_chr(feature, feature_reason)
+  ) %>%
+  select(feature, denial_reason)
+
+fairness_gender <- oof_predictions %>%
+  mutate(approved = prob_default < optimal_threshold) %>%
+  group_by(CODE_GENDER) %>%
+  summarise(
+    applicants = n(),
+    approval_rate = mean(approved),
+    avg_default_probability = mean(prob_default),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(approval_rate))
+
+fairness_education <- oof_predictions %>%
+  mutate(approved = prob_default < optimal_threshold) %>%
+  group_by(NAME_EDUCATION_TYPE) %>%
+  summarise(
+    applicants = n(),
+    approval_rate = mean(approved),
+    avg_default_probability = mean(prob_default),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(approval_rate))
+
+gender_gap <- max(fairness_gender$approval_rate) - min(fairness_gender$approval_rate)
+education_gap <- max(fairness_education$approval_rate) - min(fairness_education$approval_rate)
+
+model_details <- tibble(
+  Item = c(
+    "Model family",
+    "Version",
+    "Training file",
+    "Training rows after joins and NA filtering",
+    "Rows used to fit final model",
+    "Predictor count",
+    "Cross-validation",
+    "nrounds",
+    "max_depth",
+    "eta",
+    "subsample",
+    "colsample_bytree"
+  ),
+  Value = c(
+    "XGBoost classifier via caret::train(method = 'xgbTree')",
+    "model_card_v1",
+    "prepared_data/train_prepared.csv plus POS_CASH and credit_card aggregates",
+    nrow(training_data),
+    nrow(training_data),
+    ncol(training_data) - 2,
+    paste(cv_folds, "fold cross-validation with saved out-of-fold predictions"),
+    xgb_grid$nrounds,
+    xgb_grid$max_depth,
+    xgb_grid$eta,
+    xgb_grid$subsample,
+    xgb_grid$colsample_bytree
+  )
+)
+```
+
+# Executive Summary {.unnumbered}
+
+This model card summarizes the final Home Credit default-risk model for a business stakeholder deciding whether the model is ready for operational use. The model selected from the project is an enhanced XGBoost classifier that combines prepared application features with supplementary POS-cash and credit-card aggregates.
+
+The strongest result in the project was the enhanced XGBoost model, which achieved a cross-validated AUC of `r number(cv_auc, accuracy = 0.0001)`. Using a business-oriented operating threshold of `r percent(optimal_threshold, accuracy = 0.1)` predicted default probability, the model would approve roughly `r percent(threshold_metrics$ApprovalRate, accuracy = 0.1)` of applicants in the validation sample while capturing `r percent(threshold_metrics$Recall, accuracy = 0.1)` of observed defaulters. Under the scenario analysis in this notebook, that threshold generates approximately `r dollar(max(threshold_grid$value_per_1000), accuracy = 1)` in expected value per 1,000 screened applications.
+
+The business recommendation is to treat this model as a decision-support tool rather than a fully automated approval engine. It is strong enough to prioritize manual review and pricing decisions, but not yet strong enough for production auto-decline without further governance work. The main caveats are that the model was fit on a sampled training set for runtime reasons, the threshold analysis uses external benchmark economics rather than Home Credit’s actual portfolio profit data, and the fairness review shows meaningful approval-rate differences across education groups that should be investigated before deployment.
+
+# 1. Model Details
+
+```{r model-details-table}
+kable(model_details, col.names = c("Model Detail", "Value"))
+```
+
+The training pipeline reuses the final modeling specification from the modeling notebook and caches the fitted object locally in `models/final_model_sstrzalka.rds`. This keeps the model card reproducible without committing model artifacts to GitHub.
+
+# 2. Intended Use
+
+The intended user is a lending manager, risk analyst, or underwriting operations lead evaluating unsecured consumer loan applications. The model’s output is a predicted probability that an applicant will default.
+
+The model is designed to support three decisions:
+
+- Rank-order applicants by default risk.
+- Trigger manual review for borderline applications.
+- Support portfolio strategy discussions around approval-rate and loss-rate tradeoffs.
+
+The model is not designed for:
+
+- Fully automated adverse action without human review.
+- Pricing, limit assignment, or regulatory reporting on its own.
+- Use outside the Home Credit-style applicant population represented in the competition dataset.
+
+# 3. Performance Metrics
+
+```{r performance-table}
+kable(performance_table)
+```
+
+The cross-validated AUC comes from out-of-fold predictions saved during model training. The Kaggle public AUC (`0.73565`) is based on Kaggle's public leaderboard subset, while the private AUC (`0.72370`) is based on the hidden holdout subset used for final ranking. 
+
+# 4. Decision Threshold Analysis
+
+The operating threshold was selected by combining out-of-fold model predictions with a simple expected-value framework:
+
+- Upside if a loan repays: a gross-interest proxy based on the Federal Reserve’s `24-month` personal-loan APR at commercial banks. In the Federal Reserve’s `December 5, 2025` G.19 release for `October 2025`, the average APR for `24-month` personal loans was `11.14%`.
+- Exposure per loan: TransUnion’s `Q4 2025` unsecured personal-loan report, published `February 19, 2026`, reported average debt per borrower of `$11,699`.
+- Recovery after default: Moody’s Ratings reported a `15.0%` modelled recovery rate and `13.6%` observed historical recovery rate for unsecured consumer loans in a `December 15, 2025` securitization report.
+
+Because the repository does not contain Home Credit’s actual unit economics, the upside figure is an inference from public market data, not a direct company profit figure. I use it as a conservative scenario input, not as audited portfolio economics.
+
+Under those assumptions:
+
+- Gross interest collected on a fully repaid average 24-month loan is approximately `r dollar(profit_if_repaid, accuracy = 1)`.
+- Loss given default after `r percent(recovery_rate, accuracy = 0.1)` recovery is approximately `r dollar(loss_if_default, accuracy = 1)`.
+- The simple break-even default probability is `r percent(break_even_threshold, accuracy = 0.1)`.
+
+```{r threshold-plot, fig.height=5, fig.width=8}
+threshold_grid %>%
+  ggplot(aes(threshold, value_per_1000)) +
+  geom_line(color = "#0f766e", linewidth = 1) +
+  geom_vline(xintercept = optimal_threshold, linetype = "dashed", color = "#991b1b") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Expected Business Value by Default-Probability Threshold",
+    subtitle = "Scenario analysis based on out-of-fold predictions",
+    x = "Decline threshold",
+    y = "Expected value per 1,000 applications"
+  )
+```
+
+```{r threshold-table}
+kable(
+  threshold_scenarios,
+  col.names = c("Threshold", "Approval Rate", "Precision", "Recall", "Expected Value per 1,000")
+)
+```
+
+The selected operating threshold is `r percent(optimal_threshold, accuracy = 0.1)`. It is close to the simple break-even threshold, which is reassuring: the model’s portfolio economics and the observed prediction distribution point in the same direction.
+
+# 5. Explainability
+
+To keep runtime reasonable, SHAP values were computed on a `1,000`-row sample using XGBoost’s built-in contribution values (`predcontrib = TRUE`). The figure below summarizes the features with the largest average impact on predictions.
+
+```{r shap-plot, fig.height=5, fig.width=8}
+top_shap_features %>%
+  mutate(feature = fct_reorder(feature, mean_abs_shap)) %>%
+  ggplot(aes(mean_abs_shap, feature)) +
+  geom_col(fill = "#1d4ed8") +
+  scale_x_continuous(labels = number_format(accuracy = 0.001)) +
+  labs(
+    title = "Top Features by Mean Absolute SHAP Value",
+    subtitle = "Higher values indicate larger average impact on predicted default risk",
+    x = "Mean |SHAP value|",
+    y = NULL
+  )
+```
+
+```{r shap-table}
+kable(
+  top_shap_features %>%
+    mutate(mean_abs_shap = round(mean_abs_shap, 4)),
+  col.names = c("Feature", "Mean Absolute SHAP")
+)
+```
+
+The SHAP results are consistent with the earlier EDA and modeling work: external credit signals, affordability ratios, and prior repayment behavior dominate the model. That is a positive sign because the score is being driven primarily by credit-relevant features rather than arbitrary noise.
+
+# 6. Adverse Action Mapping
+
+Under the Equal Credit Opportunity Act and Regulation B, denied applicants must receive specific reasons for adverse action. The CFPB’s Regulation B commentary emphasizes that the reasons must be specific rather than vague or generic.
+
+The table below translates the top technical drivers into denial-language that a lending team could use as a starting point for compliant notice design. These are prototype explanations, not production-ready legal text.
+
+```{r adverse-action-table}
+kable(
+  adverse_action_table,
+  col.names = c("Technical Feature", "Human-Readable Reason")
+)
+```
+
+One governance note is important here: if a protected or sensitive attribute appears among influential features, it should not be surfaced as a denial reason and may need to be removed from the production score entirely. In this project, demographic fields are used for fairness review, not because they are necessarily appropriate production drivers.
+
+# 7. Fairness Analysis
+
+The fairness review compares approval rates at the selected operating threshold across `CODE_GENDER` and `NAME_EDUCATION_TYPE`.
+
+```{r fairness-gender-table}
+kable(
+  fairness_gender %>%
+    mutate(
+      approval_rate = percent(approval_rate, accuracy = 0.1),
+      avg_default_probability = percent(avg_default_probability, accuracy = 0.1)
+    ),
+  col.names = c("Gender", "Applicants", "Approval Rate", "Average Predicted Default")
+)
+```
+
+```{r fairness-education-table}
+kable(
+  fairness_education %>%
+    mutate(
+      approval_rate = percent(approval_rate, accuracy = 0.1),
+      avg_default_probability = percent(avg_default_probability, accuracy = 0.1)
+    ),
+  col.names = c("Education", "Applicants", "Approval Rate", "Average Predicted Default")
+)
+```
+
+```{r fairness-plots, fig.height=4.5, fig.width=8}
+bind_rows(
+  fairness_gender %>%
+    transmute(group_type = "Gender", group = CODE_GENDER, approval_rate),
+  fairness_education %>%
+    transmute(group_type = "Education", group = NAME_EDUCATION_TYPE, approval_rate)
+) %>%
+  ggplot(aes(reorder(group, approval_rate), approval_rate, fill = group_type)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ group_type, scales = "free_y") +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Approval Rates by Group at the Selected Threshold",
+    x = NULL,
+    y = "Approval rate"
+  )
+```
+
+The observed approval-rate gap is `r percent(gender_gap, accuracy = 0.1)` across gender groups and `r percent(education_gap, accuracy = 0.1)` across education groups. These are descriptive disparities, not proof of unlawful discrimination, but they are large enough to justify deeper review before deployment. At minimum, a production version should run a broader fairness audit across additional protected or proxy attributes and test whether similar performance can be achieved with less disparity.
+
+# 8. Limitations and Risks
+
+- The model card reuses the final modeling configuration, but the fitted model is based on a sampled dataset for runtime reasons. A production candidate should be trained on the full prepared dataset.
+- The threshold analysis uses public benchmark economics, not Home Credit’s actual profit, loss-severity, and collections data. Real deployment should replace these assumptions with internal finance inputs.
+- The project’s cross-validation setup optimizes discrimination, but calibration has not yet been formally tested. Before deployment, the default probabilities should be calibrated and back-tested.
+- The competition data are historical and anonymized. Real-world population drift, policy changes, and macroeconomic shocks could reduce performance.
+- Several strong signals are external credit-score variables. That creates a business risk if the strategy goal is to expand access for thin-file borrowers whose bureau data are sparse or missing.
+- Fairness and adverse-action governance are incomplete. A lender should not move this model into production without legal, compliance, and model-risk review.
+
+# 9. References
+
+- Federal Reserve Board. `G.19 Consumer Credit`, release dated `December 5, 2025`. Personal loans, `24-month`, APR at commercial banks: https://www.federalreserve.gov/releases/g19/20251205/g19.pdf
+- TransUnion. `Q4 2025 Credit Industry Insights Report` news release, published `February 19, 2026`. Unsecured personal loan metrics including average debt per borrower: https://newsroom.transunion.com/q4-2025-ciir/
+- Moody’s Ratings. `CAIXABANK CONSUMO 7, FT` new issue report, published `December 15, 2025`. Recovery-rate assumptions for unsecured consumer loans: https://www.caixabank.es/deployedfiles/gesticaixa/Estaticos/PDF/NIR_Moodys_CB_Consumo_7.pdf
+- Consumer Financial Protection Bureau. Regulation B, `§ 1002.9 Notifications`, official interpretation of specific reasons for adverse action: https://www.consumerfinance.gov/rules-policy/regulations/1002/9/

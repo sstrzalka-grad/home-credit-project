@@ -11,6 +11,26 @@ This project develops a predictive model to assess default risk for loan applica
 
 **Primary Metric:** ROC-AUC (Receiver Operating Characteristic - Area Under Curve)
 
+## Model Card
+
+`model_card_sstrzalka.qmd` is the business-facing summary of the final model. It documents the final XGBoost model choice, the recommended decision threshold, performance metrics, SHAP-based explainability, adverse-action reason mapping, fairness checks, and deployment limitations.
+
+The rendered deliverable is `model_card_sstrzalka.html`. The notebook hides code by default and is intended to be read as a document rather than as a step-by-step programming workflow.
+
+### What the Model Card Covers
+
+- Executive summary for a senior business stakeholder
+- Model details and intended use
+- Cross-validated performance metrics and space for Kaggle AUC
+- Decision-threshold analysis using sourced lending economics
+- SHAP feature-importance summary and denial-reason translation
+- Fairness review across gender and education groups
+- Limitations, risks, and deployment caveats
+
+### Local Artifacts
+
+The model card notebook caches the fitted model locally at `models/final_model_sstrzalka.rds` to avoid retraining on every render. That file is ignored by Git and should stay local only.
+
 ## Key Findings from EDA
 
 The exploratory data analysis revealed several important patterns:
