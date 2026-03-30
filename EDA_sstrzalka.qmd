@@ -1,0 +1,846 @@
+---
+title: "Home Credit EDA"
+subtitle: "IS 6812 Capstone 1"
+author: "Sarah Strzalka"
+date: "2026-02-01"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+---
+
+# Executive Summary {.unnumbered}
+
+This exploratory data analysis investigates loan default patterns in the Home Credit dataset to identify key risk factors and inform predictive modeling strategies for thin-file and no-file borrowers. Key findings include significant class imbalance (92% non-default vs 8% default), missing data patterns requiring strategic imputation, and identification of strong predictors including external credit scores, age, and employment history that can serve as alternatives to traditional credit history.
+
+# 1. Introduction and Business Problem
+
+## 1.1 Business Context
+
+Individuals with **insufficient (thin-file) or no credit (no-file) history** face significant challenges when applying for loans. Traditional lenders rely heavily on prior credit history when assessing default risk, leading many to behave in a risk-averse manner and reject applicants with limited credit history. This is a global issue affecting millions of people across several countries, disproportionately affecting:
+
+- **Younger applicants aged 18-28**
+- **Underrepresented communities**
+- **Low-income populations**
+
+As a result, many creditworthy individuals are denied access to credit and are often pushed towards higher-interest or untrustworthy lenders.
+
+**Home Credit**, a financial service company, is working to change this. They operate in countries where thin- or no-file individuals make up a large share of the population. Their goal is to accurately assess default risk for these applicants while expanding access to responsible individuals.
+
+## 1.2 Project Objectives
+
+The purpose of this project is to improve Home Credit's ability to identify creditworthy applicants who lack traditional credit histories. A successful model will enable Home Credit to:
+
+- **Improve risk assessment accuracy** for applicants, leading to better lending decisions
+- **Reduce rejections** of creditworthy borrowers who lack traditional credit histories
+- **Provide data-driven insights** into which alternative data sources (e.g., payment history, application information) are most predictive of default risk
+- **Support financial inclusion goals** by enabling more confident lending to underserved populations
+
+These improvements will help Home Credit balance growth objectives with responsible risk management.
+
+## 1.3 Success Metrics
+
+Success will be measured using both model performance and business-level credit performance metrics:
+
+### Model Performance:
+- Achieve measurable improvement in the model's ability to correctly **rank applicants by their likelihood of default** compared to baseline methods
+- Demonstrate model **consistency and reliability** through validation testing
+- Primary metric: **ROC-AUC** (Area Under the Receiver Operating Characteristic Curve)
+
+### Business Impact:
+- Improve the ability to distinguish between **high-risk and low-risk applicants** compared to current methods (current default rate is ~8%)
+- **Identify characteristics** of creditworthy thin-file applicants who could be safely approved
+- **Quantify the potential reduction** in default rates if model recommendations were implemented
+
+## 1.4 Analytics Approach
+
+Default risk predictions will be generated using a **supervised classification model** trained on historical loan outcomes. This is an analytics model that learns from historical data to recognize patterns associated with default and repayment.
+
+### Predictors Include:
+- Applicant demographic and financial characteristics
+- Prior Home Credit repayment history, if applicable
+- External credit bureau information
+- Transactional and installment payment patterns
+- Product type chosen
+
+### Target Outcome:
+- **TARGET = 0**: Loan was repaid on time (all other cases)
+- **TARGET = 1**: Client had payment difficulties (late payment > X days on at least one of the first Y installments)
+
+The model will use this information on current customers to predict the likelihood that they will default.
+
+## 1.5 Project Scope and Deliverables
+
+### Primary Deliverable:
+A **ranked list of customers segmented by their likelihood of defaulting** to support decision-making at the point of loan approval.
+
+### In Scope:
+- Exploratory data analysis of ~307,000 historical loan applications
+- Feature engineering from application, bureau, and transactional data
+- Predictive model development and validation
+- Analysis and recommendations for model deployment
+
+### Out of Scope:
+While the following could improve business outcomes, they are **outside the scope** of this project but should be considered for future work:
+- Interest pricing strategies
+- Marketing optimization
+- Loan amount optimization
+- Customer interaction method adjustments
+
+## 1.6 Constraints and Timeline
+
+### Data Constraints:
+- Kaggle dataset with approximately **307,000 historical loan applications**
+- **Missing data** across multiple features requiring careful handling
+- **Class imbalance** (8% default rate) requiring specialized techniques
+
+### Project Constraints:
+- **4-month timeline** focusing on proof-of-concept modeling
+- **Academic project** scope limited to analysis and recommendations rather than production implementation
+- **Expected completion**: April 2026
+- **Preliminary findings**: Due within one month for team feedback
+
+### Team:
+- **Analyst**: Sarah Strzalka
+
+```{r setup}
+# Load required libraries
+library(tidyverse)    # Data manipulation and visualization
+library(reshape2)     # Data reshaping
+library(scales)       # Formatting scales
+library(knitr)        # Table formatting
+library(kableExtra)   # Enhanced table styling
+library(corrplot)     # Correlation visualizations
+library(gridExtra)    # Multiple plot arrangements
+library(ggcorrplot)   # ggplot2 correlation plots
+
+# Set global theme for plots
+theme_set(theme_minimal(base_size = 12))
+
+```
+
+# 2. Data Loading and Initial Exploration
+
+## 2.1 Dataset Overview
+
+The Home Credit Default Risk dataset consists of several related tables:
+
+- **application_{train|test}.csv**: Main table with loan application data (one row per loan)
+- **bureau.csv**: Previous credits from other institutions reported to Credit Bureau
+- **bureau_balance.csv**: Monthly balances of previous credits in Credit Bureau
+- **POS_CASH_balance.csv**: Monthly balance snapshots of previous POS and cash loans
+- **credit_card_balance.csv**: Monthly snapshots of previous credit cards
+- **previous_application.csv**: Previous applications at Home Credit
+- **installments_payments.csv**: Repayment history for previous Home Credit loans
+
+
+```{r load-data}
+# Load training and test datasets
+app_train <- read_csv("Data/application_train.csv", show_col_types = FALSE)
+app_test  <- read_csv("Data/application_test.csv",  show_col_types = FALSE)
+
+# Summarize dataset dimensions
+c(train_rows = nrow(app_train), train_cols = ncol(app_train),
+  test_rows  = nrow(app_test),  test_cols  = ncol(app_test))
+
+# Preview training data structure
+glimpse(app_train)
+```
+
+> The primary dataset used in this analysis is application_train.csv, which contains 307,511 loan applications and 122 variables. Each row represents a single loan application, and the corresponding target variable (TARGET) indicates whether the applicant experienced payment difficulties.
+>
+> The test dataset contains 48,744 observations and includes the same features except for the target variable.
+>
+> The data include a diverse mix of variable types, including demographic characteristics, financial information, employment and stability indicators, housing attributes, external credit scores, and behavioral indicators such as prior credit inquiries and document submissions. Several time-based variables are encoded as negative day counts relative to the application date (e.g., age, employment duration).
+>
+
+```{r factorization}
+
+# Analyze categorical variables for factorization recommendations
+factor_scorecard <- app_train %>%
+  select(where(is.character)) %>% # Select character variables
+  pivot_longer(everything(), names_to = "variable", values_to = "category") %>% # Pivot to long format
+  mutate(category = if_else(is.na(category), "(Missing)", category)) %>% # Handle missing values
+  count(variable, category, name = "n") %>% # Count occurrences
+  group_by(variable) %>% # Group by variable
+  mutate(total_n = sum(n), # Total count per variable
+         pct = n / total_n,
+         is_rare = pct < 0.01) %>%
+  summarise(n_levels = n(), # Summarize statistics
+            missing_rate = sum(category == "(Missing)") / sum(n),
+            rare_levels = sum(is_rare),
+            rare_mass = sum(pct[is_rare]),
+            max_level_pct = max(pct),
+            .groups = "drop") %>%
+  mutate(recommendation = case_when( # Create recommendations
+         n_levels >= 25 ~ "Factorize + group rare levels (high-cardinality)",
+         rare_levels >= 5 ~ "Factorize + group rare levels (many rare categories)",
+         n_levels >= 8 ~ "Factorize (moderate levels)",
+         TRUE ~ "Keep as-is (low levels)")) %>%
+  arrange(desc(n_levels), desc(rare_levels), desc(rare_mass)) # Sort results
+
+factor_scorecard
+
+# Display variables recommended for consolidation
+factor_scorecard %>%
+  filter(recommendation != "Keep as-is (low levels)") %>%
+  select(variable, n_levels, rare_levels, rare_mass, missing_rate, recommendation)
+
+```
+
+> All character variables in the dataset should be treated as categorical (factorized) prior to modeling. However, several categorical variables contain a large number of levels, many of which occur very infrequently. For these high-cardinality variables, rare categories should be consolidated into broader groups to reduce sparsity, improve interpretability, and stabilize model estimation. In contrast, low-cardinality variables such as contract type or car and realty ownership flags can be factorized without consolidation, as they contain few levels and do not introduce sparsity.
+>
+
+## 2.2 Target Variable Distribution
+
+```{r target-summary}
+
+# Analyze target variable distribution
+target_tab <- app_train %>%
+  count(TARGET) %>%
+  mutate(
+    pct = n / sum(n),
+    label = if_else(TARGET == 1, "Default", "No Default")
+  ) %>%
+  arrange(TARGET)
+
+target_tab
+
+# Plot target variable distribution
+ggplot(target_tab, aes(label, n, fill = label)) +
+  geom_col() +
+  geom_text(
+    aes(label = scales::percent(pct, accuracy = 0.1)),
+    vjust = -0.3,
+    size = 4) +
+  scale_y_continuous(
+    breaks = seq(0, max(target_tab$n), by = 50000),
+    labels = scales::comma) +
+  labs(
+    title = "Distribution of Loan Default",
+    x = NULL,
+    y = "Number of Applications") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Calculate baseline accuracy
+baseline_accuracy <- max(target_tab$pct)
+baseline_accuracy
+```
+
+> The target variable is highly imbalanced. Approximately 91.9% of applicants did not default, while only 8.1% experienced payment difficulties.
+>
+> If we were to use a simple majority-class classifier that always predicts “no default,” the model would achieve an accuracy of 91.9%. However, this performance would be misleading, as such a model would fail to identify any borrowers who actually default.
+> 
+> Because the business objective is to identify applicants at risk of default rather than to maximize raw accuracy, accuracy alone is not an appropriate evaluation metric for this problem.
+>
+
+## 2.3 Missing & Abnormal Data Analysis
+
+### Missing Data
+
+```{r missing-data}
+
+# Summarize missing data percentages by feature
+missing_summary <- app_train %>%
+  summarise(across(everything(), ~ mean(is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "feature",
+    values_to = "missing_pct") %>%
+  arrange(desc(missing_pct))
+
+# Display top 20 features with highest missingness
+head(missing_summary, 20)
+
+```
+
+> A large proportion of variables in the dataset contain missing values, with several variables missing for more than 60% of observations. However, the most incomplete variables are related to housing characteristics, such as apartment features, building attributes, and land area.
+>
+> This pattern suggests that the missing data is largely structural. Many of these variables are only applicable to applicants living in specific housing types, such as apartment buildings, and are therefore missing for other applicants by design.
+>
+> In addition, variables such as OWN_CAR_AGE exhibit a high number of missing observations because they are only defined for applicants who own a car. In these cases, missing values may carry meaningful information and should not be treated as simple data errors.
+>
+> These observations indicate that blanket row deletion would result in substantial information loss. Instead, a combination of feature-specific imputation strategies, indicator variables, and selective feature removal will be required during data preprocessing.
+
+```{r missing}
+
+# Group missingness into bins and count features per bin
+missing_summary %>%
+  mutate(missing_bin = case_when(
+    missing_pct >= 0.7 ~ "≥70%",
+    missing_pct >= 0.5 ~ "50–69%",
+    missing_pct >= 0.3 ~ "30–49%",
+    missing_pct > 0    ~ "<30%",
+    TRUE ~ "0%")) %>%
+  count(missing_bin)
+
+```
+
+> While missing values are common in the dataset, their distribution is uneven across features. Approximately 45% of variables contain no missing values, and only a small number of features have moderate levels of missingness. About one-third of features have between 50% and 69% missing values, primarily corresponding to housing and asset-related variables that are not applicable to all applicants.
+
+### Duplicate Data
+
+```{r duplicate-rows}
+# Check for duplicate rows in the training dataset
+sum(duplicated(app_train))
+```
+
+> No duplicate rows were detected.
+
+### Anomalous Data
+
+```{r}
+# Analyze anomalous values in DAYS_EMPLOYED
+app_train %>%
+  mutate(flag_anomalous_employment = DAYS_EMPLOYED == 365243) %>%
+  count(flag_anomalous_employment)
+
+# Calculate percentage of anomalous employment by target
+app_train %>%
+  group_by(TARGET) %>%
+  summarise(
+    pct_anomalous = mean(DAYS_EMPLOYED == 365243, na.rm = TRUE))
+
+```
+
+> The variable DAYS_EMPLOYED contains a known anomalous value of 365,243, which corresponds to approximately 1,000 years of employment and is not plausible. This value is widely understood to represent applicants who are not currently employed or whose employment information is missing.
+> 
+> Approximately 18% of applicants have a DAYS_EMPLOYED value equal to 365,243. Interestingly, applicants with this value exhibit a lower default rate than those without it. About 18.5% of non-defaulters have the anomalous value, compared to only 12.0% of defaulters. This suggests that the anomaly is not random noise and may hold meaningful information about applicant status.
+> 
+> As a result, this value should not be discarded. Instead, it should be handled by creating a binary indicator for anomalous employment status and replacing the original value with a missing value or capped value when deriving employment duration features.
+>
+
+<br>
+
+# 3. Relationships Between Variables
+
+## 3.1 Numerical Variables vs Target
+
+### Age
+
+```{r age-density}
+# Distribution of age by default status
+app_train %>%
+  mutate(age_years = -DAYS_BIRTH / 365) %>% # Convert age to years
+  ggplot(aes(age_years, fill = factor(TARGET))) + # Plot density
+  geom_density(alpha = 0.5) +
+  labs(title = "Age Distribution by Default Status",
+       x = "Age (Years)",
+       fill = "Default") +
+     scale_fill_manual(
+    values = c("0" = "#F8766D", "1" = "#00BFC4"),
+    labels = c("No Default", "Default")) +
+  theme_minimal()
+```
+
+> Applicants who experienced default tend to be younger on average, with higher density concentrated in the late 20s to mid-30s. In contrast, non-defaulters are more prevalent among older age groups, particularly above age 45.
+> 
+> While the two distributions overlap substantially, the shift in density indicates a clear relationship between age and default risk. This suggests that age provides meaningful predictive signal, even in the absence of traditional credit history, and may serve as an important demographic feature in subsequent models.
+>
+
+### Employment Duration
+
+```{r employment-density}
+# Distribution of employment duration by default status
+app_train <- app_train %>%
+  mutate(
+    EMPLOYMENT_ANOMALY = DAYS_EMPLOYED == 365243, # Flag anomalous employment
+    EMPLOYMENT_YEARS = ifelse(
+      DAYS_EMPLOYED == 365243, # Handle anomaly
+      NA,
+      -DAYS_EMPLOYED / 365)) # Convert to years
+
+# Display density plot
+app_train %>%
+  ggplot(aes(x = EMPLOYMENT_YEARS, fill = factor(TARGET))) +
+  geom_density(alpha = 0.5, na.rm = TRUE) +
+  coord_cartesian(xlim = c(0, 40)) +
+  labs(
+    title = "Employment Duration by Default Status",
+    x = "Years Employed",
+    fill = "Default") +
+     scale_fill_manual(
+    values = c("0" = "#F8766D", "1" = "#00BFC4"),
+    labels = c("No Default", "Default")) +
+  theme_minimal()
+
+# Summary statistics by target
+app_train %>%
+  filter(!EMPLOYMENT_ANOMALY) %>%
+  group_by(TARGET) %>%
+  summarise(
+    mean_employment_years = mean(EMPLOYMENT_YEARS, na.rm = TRUE),
+    median_employment_years = median(EMPLOYMENT_YEARS, na.rm = TRUE),
+    n = n())
+
+```
+
+> Applicants who defaulted tend to have shorter employment histories, with higher density concentrated in the first few years of employment.
+> 
+> This pattern is supported by summary statistics: defaulters have a median employment duration of 3.37 years, compared to 4.63 years for non-defaulters. While the distributions overlap, the shift suggests that employment stability provides meaningful predictive signal and complements other demographic and affordability measures.
+>
+
+
+### Total Income
+
+```{r}
+
+# Density plot of total income by default status
+app_train %>%
+  ggplot(aes(x = AMT_INCOME_TOTAL, fill = factor(TARGET))) +
+  geom_density(alpha = 0.5) +
+  scale_x_log10() +
+  labs(
+    title = "Applicant Income by Default Status",
+    x = "Total Income (log scale)",
+    fill = "Default") +
+    scale_fill_manual(
+    values = c("0" = "#F8766D", "1" = "#00BFC4"),
+    labels = c("No Default", "Default")) +
+  theme_minimal()
+
+
+```
+
+> The income distributions of defaulters and non-defaulters exhibit substantial overlap, with both groups concentrated in similar income ranges.
+> 
+> This suggests that total income alone provides limited discriminatory power in predicting default. While income is an important component of affordability, it appears to be more informative when considered in relation to loan size rather than as an isolated feature.
+>
+
+### AMT_Credit
+
+```{r amt-credit-density}
+# Density plot of loan amount by default status
+app_train %>%
+  ggplot(aes(x = AMT_CREDIT, fill = factor(TARGET))) +
+  geom_density(alpha = 0.5) +
+  scale_x_log10() +
+  labs(
+    title = "Loan Amount by Default Status",
+    x = "Credit Amount (log scale)",
+    fill = "Default") +
+     scale_fill_manual(
+    values = c("0" = "#F8766D", "1" = "#00BFC4"),
+    labels = c("No Default", "Default")) +
+  theme_minimal()
+```
+
+> While the distributions for defaulters and non-defaulters overlap substantially, applicants who defaulted tend to be slightly more concentrated at higher credit amounts.
+> 
+> This suggests that loan size alone is only weakly associated with default risk. However, when considered alongside applicant income, loan amount may contribute meaningful information regarding affordability and repayment burden.
+>
+
+### Credit to Income Ratio
+```{r credit-income-ratio}
+# Calculate credit-to-income ratio
+app_train <- app_train %>%
+  mutate(CREDIT_TO_INCOME = AMT_CREDIT / AMT_INCOME_TOTAL)
+
+# Display density plot of credit-to-income ratio by default status
+app_train %>%
+  ggplot(aes(x = CREDIT_TO_INCOME, fill = factor(TARGET))) +
+  geom_density(alpha = 0.5) +
+  coord_cartesian(xlim = c(0, 10)) +
+  labs(
+    title = "Credit-to-Income Ratio by Default Status",
+    x = "Credit / Income",
+    fill = "Default") +
+     scale_fill_manual(
+    values = c("0" = "#F8766D", "1" = "#00BFC4"),
+    labels = c("No Default", "Default")) +
+  theme_minimal()
+```
+
+> Compared to income or loan amount individually, this ratio exhibits clearer separation between defaulters and non-defaulters. Applicants who default tend to have higher loan amounts relative to income, while non-defaulters are more concentrated at lower ratios.
+> 
+> Although the distributions still overlap substantially, the observed shift suggests that relative affordability captures meaningful risk information and may be more informative than absolute financial measures alone.
+>
+
+### External Credit Score (EXT_SOURCE_2)
+
+```{r ext-source-density}
+# Density plot of EXT_SOURCE_2 by default status
+app_train %>%
+  ggplot(aes(x = EXT_SOURCE_2, fill = factor(TARGET))) +
+  geom_density(alpha = 0.5, na.rm = TRUE) +
+  labs(
+    title = "External Credit Score (EXT_SOURCE_2) by Default Status",
+    x = "EXT_SOURCE_2",
+    fill = "Default"
+  ) +
+  scale_fill_manual(
+    values = c("0" = "#F8766D", "1" = "#00BFC4"),
+    labels = c("No Default", "Default")
+  ) +
+  theme_minimal()
+
+# Summary statistics by target
+app_train %>%
+  group_by(TARGET) %>%
+  summarise(
+    mean_ext_source_2   = mean(EXT_SOURCE_2, na.rm = TRUE),
+    median_ext_source_2 = median(EXT_SOURCE_2, na.rm = TRUE),
+    n = n()
+  )
+
+```
+
+> Applicants who defaulted have substantially lower external credit scores, while non-defaulters are concentrated at higher values. This pattern is evident across the entire distribution and is confirmed by summary statistics: the mean EXT_SOURCE_2 for defaulters is 0.411, compared to 0.523 for non-defaulters.
+> 
+> The separation between the two groups indicates that external credit scores capture strong information about borrower risk. Compared to demographic variables such as age, EXT_SOURCE_2 exhibits significantly greater discriminatory power and is expected to be among the most influential predictors in subsequent models.
+>
+> It is important to note that Home Credit’s stated mission emphasizes extending credit to applicants with limited or nontraditional credit histories. As a result, external credit score variables such as EXT_SOURCE_2, while highly predictive, may not be available for all applicants and should not be relied upon in isolation.
+> 
+> This highlights the need for models that can incorporate alternative sources of information, including demographic characteristics, employment stability, and affordability measures, to assess credit risk for individuals with sparse or missing credit bureau data.
+>
+
+## 3.2 Numerical Variables Correlation Analysis
+
+```{r correlation-plot}
+
+# Create age variable in years
+app_train <- app_train %>%
+  mutate(
+    AGE_YEARS = -DAYS_BIRTH / 365
+  )
+
+# Select key numerical variables for correlation analysis
+corr_vars <- app_train %>%
+  select(
+    TARGET,
+    AGE_YEARS,
+    EMPLOYMENT_YEARS,
+    EXT_SOURCE_1,
+    EXT_SOURCE_2,
+    EXT_SOURCE_3,
+    AMT_INCOME_TOTAL,
+    AMT_CREDIT,
+    AMT_ANNUITY,
+    CREDIT_TO_INCOME
+  )
+
+# Calculate correlation matrix
+cor_matrix <- cor(corr_vars, use = "pairwise.complete.obs")
+round(cor_matrix["TARGET", ], 3)
+
+# Plot correlation matrix
+melt(cor_matrix) %>%
+  ggplot(aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0) +
+  labs(
+    title = "Correlation Matrix of Key Numerical Variables",
+    fill = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+> A correlation analysis was conducted to summarize relationships among key numerical variables. External credit score features (EXT_SOURCE_1, EXT_SOURCE_2, and EXT_SOURCE_3) exhibit the strongest negative correlations with default, confirming their importance as predictors. Age and employment duration are also negatively correlated with default, though to a lesser extent.
+> 
+> In contrast, income and loan amount variables show minimal linear correlation with default. Several financial variables are strongly correlated with one another, including loan amount, annuity, and credit-to-income ratio, indicating potential multicollinearity. This suggests that care will be required during model specification, particularly for linear models, while tree-based models may be less sensitive to these relationships.
+
+## 3.3 Qualitative Variables vs Target
+
+```{r cat var}
+# Identify categorical variables
+cat_vars <- app_train %>%
+  select(where(is.character)) %>%
+  names()
+
+# Count of categorical variables
+length(cat_vars)
+cat_vars
+```
+
+
+```{r cat-var-plots, results='asis'}
+
+# Build function to plot default rate by categorical variable
+plot_default_rate <- function(data, var, title) {
+  data %>%
+    group_by(.data[[var]]) %>%
+    summarise(default_rate = mean(TARGET)) %>%
+    ggplot(aes(reorder(.data[[var]], default_rate), default_rate)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(
+      title = title,
+      x = NULL,
+      y = "Default Rate"
+    ) +
+    theme_minimal()
+}
+
+```
+
+
+### Education
+
+```{r education-plot}
+# Display default rate by education level
+plot_default_rate(
+  app_train,
+  "NAME_EDUCATION_TYPE",
+  "Default Rate by Education Level")
+
+```
+
+> Education level shows a clear relationship with default risk. Applicants with lower educational attainment exhibit higher default rates, while those with higher education show substantially lower rates. This suggests that education captures meaningful information relevant to repayment behavior. Categories with very small sample sizes, such as academic degree holders, would require careful handling or consolidation prior to modeling.
+>
+
+### Name Income Type
+
+```{r income-type-plot}
+# Display default rate by income type
+plot_default_rate(
+  app_train,
+  "NAME_INCOME_TYPE",
+  "Default Rate by Income Type")
+
+```
+
+> Income type shows substantial variation in default rates across categories. Applicants who are unemployed or on maternity leave exhibit significantly higher default rates, while state servants and pensioners show lower risk. This suggests that income stability is an important driver of repayment behavior. Categories with very small sample sizes may require consolidation prior to modeling to avoid unstable estimates.
+>
+
+### Ocutpation Type
+```{r occupation-type-plot}
+# Display default rate by occupation type
+plot_default_rate(
+  app_train,
+  "OCCUPATION_TYPE",
+  "Default Rate by Occupation Type")
+
+```
+
+> Default rates vary meaningfully by occupation type. Applicants in labor-intensive or lower-skilled occupations, such as cleaning staff and drivers, exhibit higher default rates, while those in managerial or specialized roles show lower risk. This suggests that job stability and skill level are relevant factors associated with repayment behavior. Categories with small sample sizes or ambiguous definitions should be treated cautiously during modeling.
+>
+
+### Family Status
+
+```{r family-status-plot}
+# Display default rate by family status
+plot_default_rate(
+  app_train,
+  "NAME_FAMILY_STATUS",
+  "Default Rate by Family Status")
+
+```
+
+> Default rates vary meaningfully by family status. Applicants who are single, in civil marriages, or separated exhibit higher default rates compared to married applicants and widows. This suggests that household stability may be associated with repayment behavior. As with other categorical variables, categories with small sample sizes or ambiguous definitions should be treated cautiously during modeling.
+>
+
+### Contract Type
+
+```{r contract-type-plot}
+# Display default rate by contract type
+plot_default_rate(
+  app_train,
+  "NAME_CONTRACT_TYPE",
+  "Default Rate by Contract Type")
+
+```
+
+> Default rates differ noticeably by contract type. Cash loans exhibit a higher default rate than revolving loans, suggesting that the structure of the loan product is associated with repayment risk. This indicates that contract type is a relevant predictor and should be included as a categorical feature in downstream models.
+>
+
+### Gender
+```{r gender}
+# Display default rate by gender
+plot_default_rate(
+  app_train,
+  "CODE_GENDER",
+  "Default Rate by Gender")
+
+```
+
+> Default rates differ modestly by gender, with male applicants exhibiting a higher observed default rate than female applicants. While this variable shows some predictive signal, it should be interpreted cautiously, as gender may be acting as a proxy for other underlying factors such as income stability, occupation, or credit history rather than being directly causal.
+
+### Housing Type
+
+```{r housing-type-plot}
+# Display default rate by housing type
+plot_default_rate(
+  app_train,
+  "NAME_HOUSING_TYPE",
+  "Default Rate by Housing Type")
+
+```
+
+> Default rates vary across housing types. Applicants living in rented apartments or with parents exhibit higher default rates, while those living in office apartments or owning a house or apartment tend to have lower default rates. This pattern suggests that housing stability may be associated with credit risk and that housing type is a useful categorical predictor.
+
+
+# 4. Data Integration
+
+## 4.1 Previous Applications Aggregation
+```{r prev-app-agg}
+# Load previous application data
+prev_app <- read_csv("Data/previous_application.csv", show_col_types = FALSE)
+
+# Aggregate previous application data by SK_ID_CURR
+prev_agg <- prev_app %>%
+  group_by(SK_ID_CURR) %>%
+  summarize(
+    prev_app_count = n(),
+    prev_credit_mean = mean(AMT_CREDIT, na.rm = TRUE),
+    .groups = "drop")
+
+# Join aggregated previous application data to main training dataset
+app_joined <- app_train %>%
+  left_join(prev_agg, by = "SK_ID_CURR")
+
+```
+
+### Number of Previous Applications
+```{r prev-app-count-plot}
+
+# Plot density of previous application count by default status
+app_joined %>%
+  ggplot(aes(prev_app_count, fill = factor(TARGET))) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Number of Previous Applications vs Default",
+    x = "Previous Application Count",
+    fill = "Default"
+  ) +
+    scale_fill_manual(
+    values = c("0" = "#F8766D", "1" = "#00BFC4"),
+    labels = c("No Default", "Default")
+  ) +
+  theme_minimal()
+
+```
+
+> Applicants with a greater number of previous applications tend to show higher default risk, indicating that aggregated transactional data may add predictive value beyond the main application dataset.
+>
+
+## 4.2 Bureau Data Integration
+```{r bureau-agg}
+# Load bureau data
+bureau <- read_csv("Data/bureau.csv", show_col_types = FALSE)
+
+# Aggregate bureau data by SK_ID_CURR
+bureau_agg <- bureau %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    bureau_count = n(),
+    bureau_active_count = sum(CREDIT_ACTIVE == "Active", na.rm = TRUE),
+    bureau_closed_count = sum(CREDIT_ACTIVE == "Closed", na.rm = TRUE),
+    bureau_total_credit = sum(AMT_CREDIT_SUM, na.rm = TRUE),
+    bureau_total_debt = sum(AMT_CREDIT_SUM_DEBT, na.rm = TRUE),
+    bureau_mean_credit = mean(AMT_CREDIT_SUM, na.rm = TRUE),
+    bureau_max_overdue = max(AMT_CREDIT_MAX_OVERDUE, na.rm = TRUE),
+    bureau_days_credit_mean = mean(DAYS_CREDIT, na.rm = TRUE)
+  )
+
+# Join aggregated bureau data to main training dataset
+app_train_joined <- app_train %>%
+  left_join(bureau_agg, by = "SK_ID_CURR")
+
+# Summarize missingness in bureau features
+app_train_joined %>%
+  summarise(
+    across(starts_with("bureau_"), ~ mean(is.na(.)))
+  )
+```
+
+> Roughly 14% of applicants do not have any bureau records, indicating that bureau data is not universally available. However, for those with bureau data, several aggregated features exhibit low missingness and can provide valuable insights into prior credit behavior.
+>
+
+### Number of Bureau Records
+```{r bureau-count-plot}
+# Summarise bureau record count by target
+app_train_joined %>%
+  group_by(TARGET) %>%
+  summarise(
+    mean_bureau_count = mean(bureau_count, na.rm = TRUE),
+    median_bureau_count = median(bureau_count, na.rm = TRUE))
+
+```
+
+> Applicants with a higher number of bureau records tend to have a slightly higher default rate, suggesting that the volume of prior credit interactions may provide some predictive signal regarding repayment behavior.
+>
+
+### Total Bureau Debt
+```{r bureau-debt-plot}
+# Summarise total bureau debt by target
+app_train_joined %>%
+  group_by(TARGET) %>%
+  summarise(
+    mean_total_debt = mean(bureau_total_debt, na.rm = TRUE),
+    median_total_debt = median(bureau_total_debt, na.rm = TRUE))
+
+```
+
+> Applicants with higher total debt reported in bureau records tend to exhibit higher default rates, indicating that overall indebtedness is a relevant factor associated with repayment risk.
+>
+
+### Active Credits
+```{r bureau-active-plot}
+# Summarise number of active credits by target
+app_train_joined %>%
+  group_by(TARGET) %>%
+  summarise(
+    mean_active_credits = mean(bureau_active_count, na.rm = TRUE))
+
+```
+
+> Applicants with a greater number of active credits reported in bureau records tend to have higher default rates, suggesting that current indebtedness may contribute to repayment challenges.
+>
+
+# 5. Conclusion and Next Steps
+
+This exploratory data analysis clarified key patterns in loan default behavior and revealed several data characteristics that directly influence the modeling approach for this project.
+
+## Data Issues Identified
+
+  - The target variable is highly imbalanced, with only about 8% of applicants defaulting, making accuracy an unreliable performance measure on its own.  
+  - Missing values are common across the dataset, but most missingness appears to be structural rather than random. Many features are only applicable to specific applicant groups, such as housing or car ownership.  
+  - Some values that appear abnormal, most notably DAYS_EMPLOYED = 365243, represent meaningful applicant conditions rather than data errors and should be retained through indicator variables.  
+  
+These issues indicate that aggressive row or feature removal would lead to substantial information loss and should be avoided.
+
+## Strong Relationships Observed
+
+  - External credit score variables (EXT_SOURCE_1, EXT_SOURCE_2, and EXT_SOURCE_3) show the strongest relationship with default. Applicants with lower scores are significantly more likely to default.  
+  - Age and employment duration are both negatively associated with default. Younger applicants and those with shorter employment histories exhibit higher default rates.  
+  - Total income and loan amount, when considered independently, provide limited separation between defaulters and non-defaulters.  
+  - Relative affordability measures, especially the credit-to-income ratio, show clearer differences between risk groups.  
+  - Several categorical variables, including education level, income type, occupation, housing type, family status, and contract type, display meaningful variation in default rates.  
+  - Aggregated information from previous applications and bureau data contributes additional signal, although a notable portion of applicants have no bureau history at all.
+
+These relationships highlight the multifaceted nature of default risk, which is influenced by a combination of credit history, demographic stability, and affordability rather than any single factor.
+
+## Impact on Analytics Approach
+
+  - The class imbalance reinforces the use of ranking-based metrics such as ROC-AUC rather than accuracy.  
+  - Missing data patterns support the use of feature-specific imputation and missingness indicators rather than simple deletion.  
+  - Correlation among financial variables suggests that tree-based models may be more effective than linear approaches.  
+  - While external credit scores are highly predictive, they are not universally available, emphasizing the need to build models that perform well using alternative data sources.  
+  - Feature engineering will focus on ratios, stability measures, and aggregated historical behavior to improve predictive performance.  
+
+## Conclusion
+
+Overall, the EDA shows that default risk depends on a mix of credit history, applicant stability, and affordability rather than any single variable. The data include nonlinear relationships, correlated financial features, and a large amount of structured missingness, which makes a tree-based classification approach a good fit for this problem. Decision trees and related methods can handle interactions between variables, do not require strong assumptions about the data, and allow missingness indicators to be used directly. This approach is especially useful for thin-file and no-file applicants, where traditional credit information may be limited and alternative data must play a larger role in assessing risk.
+
+# 6. Use of AI
+AI was havily used in conjunction with this analysis to help generate code snippets, suggest visualizations, and provide explanations of statistical concepts. The AI assistance helped streamline the coding process and provided useful insights into interpreting the data. However, all code and interpretations were carefully reviewed and validated by me to ensure accuracy and relevance to the specific context of the Home Credit Default Risk dataset. The final analysis reflects a combination of AI-generated suggestions and human suggestions.
+
+The AI assistant and Databot **DID NOT** work. A combination of several online AI tools needed to be used. I provided all context, prompts, and instructions to the AI tools. I reviewed, edited, and validated all outputs from the AI tools to ensure correctness and relevance. The AI tools were used solely as aids to assist with coding and analysis tasks under my direct supervision and control. 
+
+I often had to switch between multiple AI tools to get the desired outputs, as no single tool was sufficient for the entire task for various reasons (e.g., context length limitations, code generation quality, credit and usage limits, etc.). I found these limitations to be difficult to work with but was able to manage. It was interesting to see how different AI tools approached the same tasks in different ways, which provided a broader perspective on potential solutions.
+
+

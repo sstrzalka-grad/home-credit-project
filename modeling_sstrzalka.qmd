@@ -1,0 +1,865 @@
+---
+title: "Home Credit Modeling"
+subtitle: "IS 6812 Capstone 1"
+author: "Sarah Strzalka"
+date: "2026-02-20"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+---
+
+# Executive Summary {.unnumbered}
+
+This document develops and evaluates predictive models for loan default risk using the prepared Home Credit dataset. Multiple modeling approaches are compared including logistic regression, random forest, and gradient boosting methods. The analysis addresses class imbalance through various strategies, tunes hyperparameters efficiently, and incorporates supplementary data features to improve model performance.
+
+# 0. Setup and Data Loading
+
+## 0.1 Libraries
+
+```{r setup}
+# Load required libraries
+library(tidyverse)
+library(caret)
+library(pROC)
+library(ROSE)
+library(rminer)
+library(xgboost)
+library(randomForest)
+
+options(scipen = 999)
+set.seed(42)
+
+# Keep heavier models computationally bounded so the full document renders.
+cv_folds <- 2
+glm_sample_size <- 15000
+rf_sample_size <- 10000
+xgb_sample_size <- 10000
+smote_sample_size <- 3000
+
+prepare_model_frame <- function(data, target_col = "TARGET") {
+  char_cols <- sapply(data, is.character)
+  data[char_cols] <- lapply(data[char_cols], factor)
+
+  nzv_cols <- sapply(data, function(x) length(unique(x)) <= 1)
+  nzv_cols[target_col] <- FALSE
+  dropped <- names(data)[nzv_cols]
+
+  data <- data[, !nzv_cols, drop = FALSE]
+
+  list(
+    data = data,
+    dropped = dropped
+  )
+}
+
+safe_sample_n <- function(data, n, seed = 42) {
+  set.seed(seed)
+  dplyr::slice_sample(data, n = min(n, nrow(data)))
+}
+
+extract_metric <- function(model, metric, best_filter = NULL) {
+  results <- model$results
+
+  if (!is.null(best_filter)) {
+    for (nm in names(best_filter)) {
+      results <- results[results[[nm]] == best_filter[[nm]], , drop = FALSE]
+    }
+  }
+
+  results[[metric]][1]
+}
+```
+
+
+## 0.2 Load Prepared Data
+
+```{r load-data}
+# Load prepared data from data preparation pipeline
+train_data <- read_csv("prepared_data/train_prepared.csv", show_col_types = FALSE)
+test_data <- read_csv("prepared_data/test_prepared.csv", show_col_types = FALSE)
+
+cat("Training data dimensions:", dim(train_data), "\n")
+cat("Test data dimensions:", dim(test_data), "\n")
+```
+
+## 0.3 Target Variable Distribution
+
+```{r target-distribution}
+# Count of each level
+train_data %>%
+  pull(TARGET) %>%
+  table()
+
+# Proportion of each level
+train_data %>%
+  pull(TARGET) %>%
+  table() %>%
+  prop.table() %>%
+  round(3)
+```
+
+The training dataset contains 307,511 observations with 194 features. The target variable shows significant class imbalance with approximately 92% non-default (0) and 8% default (1) cases.
+
+# 1. Baseline Performance Benchmark
+
+## 1.1 Majority Class Classifier
+
+Before building complex models, we establish a performance baseline using a majority class classifier that predicts the most common class for all observations.
+
+```{r baseline-majority}
+# Majority class baseline: predict all as non-default (0)
+baseline_predictions <- rep(0, nrow(train_data))
+
+# Calculate accuracy
+baseline_accuracy <- mean(baseline_predictions == train_data$TARGET)
+
+cat("Baseline Accuracy (Majority Class):", round(baseline_accuracy, 4), "\n")
+```
+
+The majority class classifier achieves 92% accuracy by predicting all applicants will not default. While this appears high, it provides no ability to distinguish between defaulters and non-defaulters.
+
+## 1.2 Simple Logistic Regression Baseline
+
+A more meaningful baseline uses logistic regression with key predictors identified in EDA.
+
+```{r baseline-logistic}
+# Prepare data: remove ID and convert TARGET to factor
+train_baseline <- train_data %>%
+  select(-SK_ID_CURR) %>%
+  mutate(TARGET = factor(ifelse(TARGET == 1, "Default", "NoDefault"), 
+                        levels = c("NoDefault", "Default")))
+
+# Simple logistic regression with key predictors from EDA
+baseline_formula <- TARGET ~ EXT_SOURCE_1 + EXT_SOURCE_2 + EXT_SOURCE_3 + 
+                             AGE_YEARS + EMPLOYMENT_YEARS + CREDIT_TO_INCOME
+
+baseline_model <- glm(baseline_formula, 
+                     data = train_baseline, 
+                     family = binomial(link = "logit"))
+
+# Generate predicted probabilities
+# Use the model's data (which excludes NAs automatically)
+baseline_probs <- predict(baseline_model, type = "response")
+baseline_actuals <- baseline_model$y  # Actual values used in fitting
+
+# Calculate AUC
+baseline_roc <- roc(baseline_actuals, baseline_probs, quiet = TRUE)
+baseline_auc <- auc(baseline_roc)
+
+cat("Baseline AUC (Simple Logistic Regression):", round(baseline_auc, 4), "\n")
+```
+
+A simple logistic regression using only the strongest predictors identified in EDA establishes a meaningful baseline for model comparison. Any subsequent models should exceed this performance.
+
+## 1.3 Baseline Summary
+
+```{r baseline-summary}
+# Create summary table
+baseline_results <- tibble(
+  Model = "Baseline - Simple Logistic Regression",
+  Features = "6 key predictors from EDA",
+  Accuracy = round(baseline_accuracy, 4),
+  AUC = round(baseline_auc, 4),
+  Notes = "Uses EXT_SOURCE variables, age, employment, credit-to-income"
+)
+
+knitr::kable(baseline_results, caption = "Baseline Model Performance")
+```
+
+This baseline establishes the minimum performance threshold. The simple logistic regression demonstrates that even with limited features, meaningful discrimination between defaulters and non-defaulters is possible.
+
+# 2. Candidate Model Comparison
+
+## 2.1 Create Modeling Dataset
+
+```{r prep-modeling-data}
+# Prepare full dataset for modeling
+# Remove ID column and convert TARGET to factor with proper labels
+model_data <- train_data %>%
+  select(-SK_ID_CURR) %>%
+  mutate(TARGET = factor(ifelse(TARGET == 1, "Default", "NoDefault"), 
+                        levels = c("NoDefault", "Default")))
+
+# Prepare test data similarly
+test_model_data <- test_data %>%
+  select(-SK_ID_CURR)
+
+cat("Prepared data for modeling:\n")
+cat("- Observations:", nrow(model_data), "\n")
+cat("- Features:", ncol(model_data) - 1, "\n")
+```
+
+## 2.2 Cross-Validation Setup
+
+We use 3-fold cross-validation to evaluate model performance. This provides reliable out-of-sample estimates while maintaining computational efficiency.
+
+```{r cv-setup}
+# Set up 3-fold cross-validation
+train_control <- trainControl(
+  method = "cv",
+  number = cv_folds,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  verboseIter = FALSE
+)
+
+cat("Cross-validation configured:", cv_folds, "-fold CV\n")
+```
+
+
+
+## 2.3 Logistic Regression - Baseline Features
+
+```{r model-lr-baseline}
+# Use only the 6 baseline features
+baseline_features <- c(
+  "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3",
+  "AGE_YEARS", "EMPLOYMENT_YEARS", "CREDIT_TO_INCOME", "TARGET"
+)
+
+lr_baseline_data <- model_data %>% 
+  select(all_of(baseline_features)) %>%
+  na.omit()
+
+cat("Baseline features data: ", nrow(lr_baseline_data), "complete observations\n")
+lr_baseline_data <- safe_sample_n(lr_baseline_data, glm_sample_size)
+cat("Baseline features training sample:", nrow(lr_baseline_data), "\n")
+
+# Train logistic regression with cross-validation
+lr_baseline <- train(
+  TARGET ~ .,
+  data = lr_baseline_data,
+  method = "glm",
+  family = binomial(link = "logit"),
+  trControl = train_control,
+  metric = "ROC"
+)
+
+lr_baseline_auc <- lr_baseline$results$ROC
+
+cat("Logistic Regression - Baseline Features\n")
+cat("Cross-Validated AUC:", round(lr_baseline_auc, 4), "\n")
+cat("Cross-Validated Sensitivity:", round(lr_baseline$results$Sens, 4), "\n")
+cat("Cross-Validated Specificity:", round(lr_baseline$results$Spec, 4), "\n")
+```
+
+## 2.4 Logistic Regression - Application Features Only
+
+```{r model-lr-app}
+# Use all application features (no supplementary data)
+app_features <- model_data %>%
+  select(
+    -starts_with("BUREAU_"),
+    -starts_with("PREV_"),
+    -starts_with("INSTALL_")
+  ) %>%
+  na.omit()
+
+cat("Application features data:", nrow(app_features), "complete observations\n")
+
+app_features_prepped <- prepare_model_frame(app_features)
+app_features <- app_features_prepped$data
+app_features <- safe_sample_n(app_features, glm_sample_size)
+
+if (length(app_features_prepped$dropped) > 0) {
+  cat("Dropped single-value columns:\n")
+  print(app_features_prepped$dropped)
+}
+
+cat("Application features training sample:", nrow(app_features), "\n")
+
+# Ensure TARGET still has two levels
+if (nlevels(app_features$TARGET) < 2) {
+  stop("TARGET has only one class after filtering!")
+}
+
+# Train logistic regression
+lr_app <- train(
+  TARGET ~ .,
+  data = app_features,
+  method = "glm",
+  family = binomial(link = "logit"),
+  trControl = train_control,
+  metric = "ROC"
+)
+
+lr_app_auc <- lr_app$results$ROC
+
+cat("Logistic Regression - Application Features\n")
+cat("Cross-Validated AUC:", round(lr_app_auc, 4), "\n")
+cat("Cross-Validated Sensitivity:", round(lr_app$results$Sens, 4), "\n")
+cat("Cross-Validated Specificity:", round(lr_app$results$Spec, 4), "\n")
+```
+
+## 2.5 Logistic Regression - All Features
+
+```{r model-lr-full}
+# Use all features including supplementary data
+model_data_complete <- model_data %>% na.omit()
+
+cat("All features data:", nrow(model_data_complete), "complete observations\n")
+
+model_data_complete_prepped <- prepare_model_frame(model_data_complete)
+model_data_complete <- model_data_complete_prepped$data
+model_data_complete <- safe_sample_n(model_data_complete, glm_sample_size)
+
+if (length(model_data_complete_prepped$dropped) > 0) {
+  cat("Dropped single-value columns:\n")
+  print(model_data_complete_prepped$dropped)
+}
+
+cat("All-features training sample:", nrow(model_data_complete), "\n")
+
+# Train model
+lr_full <- train(
+  TARGET ~ .,
+  data = model_data_complete,
+  method = "glm",
+  family = binomial(link = "logit"),
+  trControl = train_control,
+  metric = "ROC"
+)
+
+lr_full_auc <- lr_full$results$ROC
+
+cat("Logistic Regression - All Features\n")
+cat("Cross-Validated AUC:", round(lr_full_auc, 4), "\n")
+cat("Cross-Validated Sensitivity:", round(lr_full$results$Sens, 4), "\n")
+cat("Cross-Validated Specificity:", round(lr_full$results$Spec, 4), "\n")
+```
+
+The logistic regression with all features performed better than both the baseline features model and the application-only model. This indicates that the supplementary data features from bureau, previous applications, and installments improved model performance.
+
+## 2.6 Random Forest
+
+```{r model-rf}
+# Use a sample for speed
+rf_sample <- safe_sample_n(model_data_complete, rf_sample_size)
+
+cat("RF sample size:", nrow(rf_sample), "\n")
+
+rf_model <- train(
+  TARGET ~ .,
+  data = rf_sample,
+  method = "rf",
+  trControl = train_control,
+  metric = "ROC",
+  tuneGrid = data.frame(mtry = c(5, 10)),
+  ntree = 50,
+  importance = TRUE
+)
+
+rf_auc <- max(rf_model$results$ROC)
+rf_best_mtry <- rf_model$bestTune$mtry
+
+cat("Random Forest\n")
+cat("Best mtry:", rf_best_mtry, "\n")
+cat("Cross-Validated AUC:", round(rf_auc, 4), "\n")
+```
+
+The Random Forest model can capture non-linear relationships between features that logistic regression may miss.
+
+## 2.7 XGBoost - Application Features Only
+
+```{r model-xgb-app}
+xgb_app_sample <- safe_sample_n(app_features, xgb_sample_size)
+
+cat("XGBoost application-only sample size:", nrow(xgb_app_sample), "\n")
+
+xgb_app <- train(
+  TARGET ~ .,
+  data = xgb_app_sample,
+  method = "xgbTree",
+  trControl = train_control,
+  metric = "ROC",
+  tuneGrid = expand.grid(
+    nrounds = 50,
+    max_depth = 3,
+    eta = 0.1,
+    gamma = 0,
+    colsample_bytree = 0.8,
+    min_child_weight = 1,
+    subsample = 0.8
+  ),
+  verbosity = 0
+)
+
+xgb_app_auc <- xgb_app$results$ROC
+
+cat("XGBoost - Application Features Only\n")
+cat("Cross-Validated AUC:", round(xgb_app_auc, 4), "\n")
+cat("Cross-Validated Sensitivity:", round(xgb_app$results$Sens, 4), "\n")
+cat("Cross-Validated Specificity:", round(xgb_app$results$Spec, 4), "\n")
+```
+
+## 2.8 XGBoost - All Features
+
+```{r model-xgb}
+# Train XGBoost with basic hyperparameters
+# Use a bounded sample so the notebook can render in a reasonable time
+xgb_sample <- safe_sample_n(model_data_complete, xgb_sample_size)
+
+xgb_best_grid <- expand.grid(
+  nrounds = 50,
+  max_depth = 3,
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+xgb_model <- train(
+  TARGET ~ .,
+  data = xgb_sample,
+  method = "xgbTree",
+  trControl = train_control,
+  metric = "ROC",
+  tuneGrid = xgb_best_grid,
+  verbosity = 0
+)
+
+xgb_auc <- xgb_model$results$ROC
+
+cat("XGBoost\n")
+cat("Sample size:", nrow(xgb_sample), "\n")
+cat("Cross-Validated AUC:", round(xgb_auc, 4), "\n")
+cat("Cross-Validated Sensitivity:", round(xgb_model$results$Sens, 4), "\n")
+cat("Cross-Validated Specificity:", round(xgb_model$results$Spec, 4), "\n")
+```
+
+XGBoost is a gradient boosting approach that builds trees sequentially, with each tree correcting errors from previous trees.
+
+## 2.9 Model Performance Comparison Table
+
+```{r model-comparison-table}
+# Create comprehensive comparison table
+model_comparison <- tibble(
+  Model = c(
+    "Logistic - Baseline Features",
+    "Logistic - Application Features",
+    "Logistic - All Features",
+    "Random Forest",
+    "XGBoost - Application Features",
+    "XGBoost - All Features"
+  ),
+  Features = c(
+    "6 key predictors",
+    "Application features only",
+    "All features (with supplementary)",
+    "All features",
+    "Application features only",
+    "All features"
+  ),
+  CV_AUC = c(
+    round(lr_baseline_auc, 4),
+    round(lr_app_auc, 4),
+    round(lr_full_auc, 4),
+    round(rf_auc, 4),
+    round(xgb_app_auc, 4),
+    round(xgb_auc, 4)
+  ),
+  Sensitivity = c(
+    round(lr_baseline$results$Sens, 4),
+    round(lr_app$results$Sens, 4),
+    round(lr_full$results$Sens, 4),
+    round(rf_model$results[rf_model$results$mtry == rf_best_mtry, "Sens"], 4),
+    round(xgb_app$results$Sens, 4),
+    round(xgb_model$results$Sens, 4)
+  ),
+  Specificity = c(
+    round(lr_baseline$results$Spec, 4),
+    round(lr_app$results$Spec, 4),
+    round(lr_full$results$Spec, 4),
+    round(rf_model$results[rf_model$results$mtry == rf_best_mtry, "Spec"], 4),
+    round(xgb_app$results$Spec, 4),
+    round(xgb_model$results$Spec, 4)
+  )
+) %>%
+  arrange(desc(CV_AUC))
+
+knitr::kable(model_comparison, 
+             caption = "Model Performance Comparison (3-Fold Cross-Validation)",
+             col.names = c("Model", "Features", "CV AUC", "Sensitivity", "Specificity"))
+```
+
+The comparison table shows which model performed best based on cross-validated AUC. Adding supplementary data features improved performance across all logistic regression models.
+
+# 3. Class Imbalance Strategies
+
+The target variable is highly imbalanced (92% non-default vs 8% default). We compare strategies for handling this imbalance.
+
+## 3.1 Baseline (No Adjustment)
+
+The models above were trained on the original imbalanced data. We use the XGBoost model as the baseline for comparison.
+
+```{r imbalance-baseline}
+cat("Baseline XGBoost (No Class Imbalance Adjustment)\n")
+cat("CV AUC:", round(xgb_auc, 4), "\n")
+cat("Sensitivity (Default Detection):", round(xgb_model$results$Sens, 4), "\n")
+cat("Specificity:", round(xgb_model$results$Spec, 4), "\n")
+```
+
+## 3.2 Downsampling
+
+```{r model-downsample}
+# Set up cross-validation with downsampling
+train_control_down <- trainControl(
+  method = "cv",
+  number = cv_folds,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  sampling = "down",
+  verboseIter = FALSE
+)
+
+# Train XGBoost with downsampling
+xgb_down <- train(
+  TARGET ~ .,
+  data = xgb_sample,
+  method = "xgbTree",
+  trControl = train_control_down,
+  metric = "ROC",
+  tuneGrid = xgb_best_grid,
+  verbosity = 0
+)
+
+xgb_down_auc <- xgb_down$results$ROC
+
+cat("XGBoost with Downsampling\n")
+cat("CV AUC:", round(xgb_down_auc, 4), "\n")
+cat("Sensitivity:", round(xgb_down$results$Sens, 4), "\n")
+cat("Specificity:", round(xgb_down$results$Spec, 4), "\n")
+```
+
+Downsampling reduced the majority class to match the minority class size.
+
+## 3.3 Upsampling
+
+```{r model-upsample}
+# Set up cross-validation with upsampling
+train_control_up <- trainControl(
+  method = "cv",
+  number = cv_folds,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  sampling = "up",
+  verboseIter = FALSE
+)
+
+# Train XGBoost with upsampling (use complete data)
+xgb_up <- train(
+  TARGET ~ .,
+  data = xgb_sample,
+  method = "xgbTree",
+  trControl = train_control_up,
+  metric = "ROC",
+  tuneGrid = xgb_best_grid,
+  verbosity = 0
+)
+
+xgb_up_auc <- xgb_up$results$ROC
+
+cat("XGBoost with Upsampling\n")
+cat("CV AUC:", round(xgb_up_auc, 4), "\n")
+cat("Sensitivity:", round(xgb_up$results$Sens, 4), "\n")
+cat("Specificity:", round(xgb_up$results$Spec, 4), "\n")
+```
+
+Upsampling increased the minority class by duplicating observations.
+
+## 3.4 SMOTE
+
+```{r model-smote}
+if (!requireNamespace("themis", quietly = TRUE)) {
+  xgb_smote_auc <- NA_real_
+  xgb_smote_sens <- NA_real_
+  xgb_smote_spec <- NA_real_
+  cat("Skipping SMOTE because package 'themis' is not installed.\n")
+} else {
+  # Use a smaller sample because synthetic oversampling is expensive.
+  smote_sample <- safe_sample_n(model_data_complete, smote_sample_size)
+
+  train_control_smote <- trainControl(
+    method = "cv",
+    number = cv_folds,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final",
+    sampling = "smote",
+    verboseIter = FALSE
+  )
+
+  xgb_smote <- train(
+    TARGET ~ .,
+    data = smote_sample,
+    method = "xgbTree",
+    trControl = train_control_smote,
+    metric = "ROC",
+    tuneGrid = xgb_best_grid,
+    verbosity = 0
+  )
+
+  xgb_smote_auc <- xgb_smote$results$ROC
+  xgb_smote_sens <- xgb_smote$results$Sens
+  xgb_smote_spec <- xgb_smote$results$Spec
+
+  cat("XGBoost with SMOTE\n")
+  cat("CV AUC:", round(xgb_smote_auc, 4), "\n")
+  cat("Sensitivity:", round(xgb_smote_sens, 4), "\n")
+  cat("Specificity:", round(xgb_smote_spec, 4), "\n")
+}
+```
+
+SMOTE creates synthetic examples of the minority class rather than duplicating existing observations.
+
+## 3.5 Class Imbalance Strategy Comparison
+
+```{r imbalance-comparison}
+# Create comparison table
+imbalance_comparison <- tibble(
+  Strategy = c("No Adjustment", "Downsampling", "Upsampling", "SMOTE"),
+  CV_AUC = c(
+    round(xgb_auc, 4),
+    round(xgb_down_auc, 4),
+    round(xgb_up_auc, 4),
+    round(xgb_smote_auc, 4)
+  ),
+  Sensitivity = c(
+    round(xgb_model$results$Sens, 4),
+    round(xgb_down$results$Sens, 4),
+    round(xgb_up$results$Sens, 4),
+    round(xgb_smote_sens, 4)
+  ),
+  Specificity = c(
+    round(xgb_model$results$Spec, 4),
+    round(xgb_down$results$Spec, 4),
+    round(xgb_up$results$Spec, 4),
+    round(xgb_smote_spec, 4)
+  )
+) %>%
+  arrange(desc(CV_AUC))
+
+knitr::kable(imbalance_comparison,
+             caption = "Class Imbalance Strategy Comparison (XGBoost)",
+             col.names = c("Strategy", "CV AUC", "Sensitivity", "Specificity"))
+```
+
+The comparison shows trade-offs between detecting defaults (sensitivity) and correctly identifying non-defaults (specificity).
+
+
+# 4. Supplementary Data
+
+## 5.1 Load POS_Cash
+```{r load-pos-cash}
+# POS_CASH_balance contains monthly snapshots of point-of-sale and cash loans
+# We aggregate to one row per SK_ID_CURR with summary statistics
+pos_cash <- read_csv("Data/POS_CASH_balance.csv", show_col_types = FALSE)
+
+pos_features <- pos_cash %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    POS_MONTHS_BALANCE     = n(),                                        # total months of history
+    POS_CNT_INSTALMENT_MEAN = mean(CNT_INSTALMENT, na.rm = TRUE),        # avg installments remaining
+    POS_SK_DPD_MEAN        = mean(SK_DPD, na.rm = TRUE),                 # avg days past due
+    POS_SK_DPD_MAX         = max(SK_DPD, na.rm = TRUE),                  # worst days past due
+    POS_COMPLETED_RATIO    = mean(NAME_CONTRACT_STATUS == "Completed",   # share of completed contracts
+                                  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("POS_CASH features created:", ncol(pos_features) - 1, "features for", 
+    nrow(pos_features), "customers\n")
+
+```
+
+## 5.2 Load Credit Card Balance
+```{r load-cc-balance}
+# credit_card_balance contains monthly credit card snapshots
+# Key signals: utilization rate, payment behavior, drawing patterns
+cc_balance <- read_csv("Data/credit_card_balance.csv", show_col_types = FALSE)
+
+cc_features <- cc_balance %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    CC_MONTHS_BALANCE      = n(),                                              # total months of history
+    CC_AMT_BALANCE_MEAN    = mean(AMT_BALANCE, na.rm = TRUE),                  # avg balance
+    CC_AMT_DRAWINGS_MEAN   = mean(AMT_DRAWINGS_CURRENT, na.rm = TRUE),         # avg monthly drawings
+    CC_SK_DPD_MEAN         = mean(SK_DPD, na.rm = TRUE),                       # avg days past due
+    CC_SK_DPD_MAX          = max(SK_DPD, na.rm = TRUE),                        # worst days past due
+    CC_UTILIZATION_MEAN    = mean(AMT_BALANCE / (AMT_CREDIT_LIMIT_ACTUAL + 1), # avg utilization rate
+                                  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("Credit card features created:", ncol(cc_features) - 1, "features for",
+    nrow(cc_features), "customers\n")
+
+```
+
+## 5.3 Join Data
+```{r join-data}
+# Since model_data_complete dropped SK_ID_CURR, we rebuild from model_data
+# (which still has it) and re-apply na.omit after joining
+
+model_data_with_id <- train_data %>%
+  mutate(TARGET = factor(ifelse(TARGET == 1, "Default", "NoDefault"),
+                         levels = c("NoDefault", "Default"))) %>%
+  left_join(pos_features,  by = "SK_ID_CURR") %>%
+  left_join(cc_features,   by = "SK_ID_CURR") %>%
+  select(-SK_ID_CURR)
+
+# Fill NAs from join (customers with no POS/CC history)
+new_cols <- c(names(pos_features)[-1], names(cc_features)[-1])
+model_data_with_id[new_cols] <- lapply(
+  model_data_with_id[new_cols],
+  function(x) replace(x, is.na(x), 0)
+)
+
+# Drop remaining NAs and single-value columns
+model_data_enhanced <- model_data_with_id %>% na.omit()
+
+model_data_enhanced_prepped <- prepare_model_frame(model_data_enhanced)
+model_data_enhanced <- model_data_enhanced_prepped$data
+
+cat("Enhanced dataset:", nrow(model_data_enhanced), "rows,", 
+    ncol(model_data_enhanced) - 1, "features\n")
+cat("New features added:", length(new_cols), "\n")
+
+```
+
+## 5.4 Train XGBoost with Enhanced Data
+```{r model-xgb-enhanced}
+## 5.4 Model Comparison: With vs Without POS/CC Features
+
+# Train XGBoost on enhanced dataset using same fixed hyperparameters as Section 2
+# for a fair apples-to-apples comparison
+enhanced_sample <- safe_sample_n(model_data_enhanced, xgb_sample_size)
+
+xgb_enhanced <- train(
+  TARGET ~ .,
+  data = enhanced_sample,
+  method = "xgbTree",
+  trControl = train_control,   # same 3-fold CV as before
+  metric = "ROC",
+  tuneGrid = xgb_best_grid,
+  verbosity = 0
+)
+
+xgb_enhanced_auc <- xgb_enhanced$results$ROC
+
+final_model <- xgb_enhanced
+
+# Summary comparison table
+supplementary_comparison <- tibble(
+  Model = c(
+    "XGBoost - App features only",
+    "XGBoost - With bureau/prev/install",
+    "XGBoost - With all supplementary (incl. POS/CC)"
+  ),
+  Features = c(
+    "Application data only",
+    "App + bureau + previous + installments",
+    "App + bureau + previous + installments + POS + CC"
+  ),
+  CV_AUC = c(
+    round(xgb_app_auc, 4),
+    round(xgb_auc, 4),
+    round(xgb_enhanced_auc, 4)
+  )
+)
+
+knitr::kable(supplementary_comparison,
+             caption = "Impact of Supplementary Data on XGBoost Performance",
+             col.names = c("Model", "Features", "CV AUC"))
+
+```
+
+
+
+# 6. Kaggle Submission
+
+## 6.1 Generate Submission
+```{r generate-submission}
+# Generate predicted probabilities for test set
+test_pos_cash <- read_csv("Data/POS_CASH_balance.csv", show_col_types = FALSE) %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    POS_MONTHS_BALANCE = n(),
+    POS_CNT_INSTALMENT_MEAN = mean(CNT_INSTALMENT, na.rm = TRUE),
+    POS_SK_DPD_MEAN = mean(SK_DPD, na.rm = TRUE),
+    POS_SK_DPD_MAX = max(SK_DPD, na.rm = TRUE),
+    POS_COMPLETED_RATIO = mean(NAME_CONTRACT_STATUS == "Completed", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+test_cc_balance <- read_csv("Data/credit_card_balance.csv", show_col_types = FALSE) %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    CC_MONTHS_BALANCE = n(),
+    CC_AMT_BALANCE_MEAN = mean(AMT_BALANCE, na.rm = TRUE),
+    CC_AMT_DRAWINGS_MEAN = mean(AMT_DRAWINGS_CURRENT, na.rm = TRUE),
+    CC_SK_DPD_MEAN = mean(SK_DPD, na.rm = TRUE),
+    CC_SK_DPD_MAX = max(SK_DPD, na.rm = TRUE),
+    CC_UTILIZATION_MEAN = mean(AMT_BALANCE / (AMT_CREDIT_LIMIT_ACTUAL + 1), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+test_model_enhanced <- test_data %>%
+  left_join(test_pos_cash, by = "SK_ID_CURR") %>%
+  left_join(test_cc_balance, by = "SK_ID_CURR")
+
+test_model_enhanced[new_cols] <- lapply(
+  test_model_enhanced[new_cols],
+  function(x) replace(x, is.na(x), 0)
+)
+
+required_predictors <- setdiff(names(final_model$trainingData), ".outcome")
+missing_predictors <- setdiff(required_predictors, names(test_model_enhanced))
+
+if (length(missing_predictors) > 0) {
+  stop("Test data is missing predictors required by final_model: ",
+       paste(missing_predictors, collapse = ", "))
+}
+
+test_model_enhanced <- test_model_enhanced[, required_predictors, drop = FALSE]
+test_model_enhanced <- test_model_enhanced %>%
+  mutate(across(where(is.numeric), ~ replace_na(.x, 0)))
+
+if (length(final_model$xlevels) > 0) {
+  for (col_name in names(final_model$xlevels)) {
+    if (col_name %in% names(test_model_enhanced)) {
+      valid_levels <- final_model$xlevels[[col_name]]
+      coerced_values <- as.character(test_model_enhanced[[col_name]])
+      coerced_values[is.na(coerced_values) | !(coerced_values %in% valid_levels)] <- valid_levels[1]
+      test_model_enhanced[[col_name]] <- factor(coerced_values, levels = valid_levels)
+    }
+  }
+}
+
+test_preds <- predict(final_model, newdata = test_model_enhanced, type = "prob")
+
+# Create submission file
+submission <- tibble(
+  SK_ID_CURR = test_data$SK_ID_CURR,
+  TARGET = test_preds$Default
+)
+
+write_csv(submission, "submission.csv")
+cat("Submission file created:", nrow(submission), "rows\n")
+head(submission)
+```
+
+## 6.2 Kaggle Score

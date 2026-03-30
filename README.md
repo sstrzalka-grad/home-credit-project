@@ -1,193 +1,149 @@
-# Home Credit Default Risk Prediction
+# Home Credit Default Risk Portfolio
 
-**IS 6812 Capstone Project - Spring 2026**  
-**Author:** Sarah Strzalka
+Individual portfolio repository for my work on the Home Credit Default Risk project in `IS 6812 Capstone`.
 
-## Project Overview
+This project asked a practical lending question: can we use alternative and behavioral data to predict default risk for applicants with limited traditional credit history? My work focused on building a reproducible feature pipeline, comparing candidate models, selecting a business operating threshold, and documenting the final model in a business-facing model card.
 
-This project develops a predictive model to assess default risk for loan applicants with limited or no credit history. Using historical Home Credit data, the model aims to improve lending decisions by identifying creditworthy applicants who would traditionally be rejected due to insufficient credit history.
+## Business Summary
 
-**Business Objective:** Enable Home Credit to expand financial inclusion while maintaining responsible risk management by accurately predicting loan default probability for underserved populations.
+Home Credit’s business challenge is balancing two competing goals:
 
-**Primary Metric:** ROC-AUC (Receiver Operating Characteristic - Area Under Curve)
+- Expand access to credit for thin-file borrowers.
+- Control losses from default.
 
-## Model Card
+I approached this as a credit-risk ranking problem. The core output is a predicted probability of default for each applicant, which can be used to support approval decisions, manual review, and broader lending strategy.
 
-`model_card_sstrzalka.qmd` is the business-facing summary of the final model. It documents the final XGBoost model choice, the recommended decision threshold, performance metrics, SHAP-based explainability, adverse-action reason mapping, fairness checks, and deployment limitations.
+## Final Result
 
-The rendered deliverable is `model_card_sstrzalka.html`. The notebook hides code by default and is intended to be read as a document rather than as a step-by-step programming workflow.
+- Best model in my workflow: enhanced `XGBoost`
+- Final cross-validated AUC in the model card: `0.7511`
+- Kaggle public AUC: `0.73565`
+- Kaggle private AUC: `0.72370`
+- Recommended operating threshold: `12.0%` predicted default probability
 
-### What the Model Card Covers
+At that operating threshold, the model card estimated:
 
-- Executive summary for a senior business stakeholder
-- Model details and intended use
-- Cross-validated performance metrics and space for Kaggle AUC
-- Decision-threshold analysis using sourced lending economics
-- SHAP feature-importance summary and denial-reason translation
-- Fairness review across gender and education groups
-- Limitations, risks, and deployment caveats
+- Approval rate of `86.1%`
+- Recall of `42.7%` for defaults
+- Expected value of about `$776,256` per 1,000 screened applications under the public benchmark assumptions documented in the model card
 
-### Local Artifacts
+## Portfolio Notebooks
 
-The model card notebook caches the fitted model locally at `models/final_model_sstrzalka.rds` to avoid retraining on every render. That file is ignored by Git and should stay local only.
+These notebooks represent my individual work product for the project.
 
-## Key Findings from EDA
+| Notebook | Purpose |
+|---|---|
+| [EDA_sstrzalka.qmd](./EDA_sstrzalka.qmd) | Exploratory analysis of default patterns, missingness, and early risk signals |
+| [data_preparation_sstrzalka.qmd](./data_preparation_sstrzalka.qmd) | Reproducible train/test-safe feature engineering and data preparation pipeline |
+| [modeling_sstrzalka.qmd](./modeling_sstrzalka.qmd) | Candidate model comparison, imbalance handling, supplementary-data evaluation, and Kaggle submission generation |
+| [model_card_sstrzalka.qmd](./model_card_sstrzalka.qmd) | Business-facing model documentation including thresholding, SHAP, fairness review, and limitations |
 
-The exploratory data analysis revealed several important patterns:
+GitHub renders `.qmd` source files directly, so the repository keeps the code-first notebooks rather than relying on HTML outputs.
 
-- **Class Imbalance:** 92% non-default vs 8% default rate
-- **Strongest Predictors:** External credit scores (EXT_SOURCE variables), age, employment duration
-- **Important Ratios:** Credit-to-income ratio shows better separation than absolute amounts
-- **Missing Data:** Structural missingness in housing and asset variables; missing patterns are informative
-- **Data Quality Issues:** DAYS_EMPLOYED anomaly (365243) represents unemployment or missing status
-- **Categorical Signals:** Education, occupation, income type, and housing type show meaningful variation in default rates
+## What I Built
 
-## Data Preparation Pipeline
+### 1. Reproducible feature engineering
 
-### Overview
+I created a preparation workflow that:
 
-`data_preparation_sstrzalka.qmd` implements a production-ready data preparation pipeline that transforms raw Home Credit data into model-ready features while ensuring train/test consistency to prevent data leakage.
+- cleaned the `DAYS_EMPLOYED = 365243` anomaly
+- imputed missing values using training-derived statistics
+- created missingness indicators
+- engineered affordability, stability, and interaction features
+- aggregated supplementary tables including bureau, previous applications, installments, POS cash, and credit card history
+- enforced train/test column consistency to reduce leakage risk
 
-### What It Does
+### 2. Model comparison with a clear baseline
 
-The pipeline performs the following operations:
+I compared:
 
-**1. Data Cleaning**
-- Handles DAYS_EMPLOYED anomaly by creating indicator variable and replacing with NA
-- Creates missing data indicators for key predictive features
-- Imputes missing values using training-derived medians for numeric variables and modes for categorical variables
+- majority-class and simple logistic baselines
+- logistic regression on baseline, application-only, and full feature sets
+- random forest
+- XGBoost
+- class-imbalance strategies including downsampling, upsampling, and SMOTE
 
-**2. Feature Engineering - Demographics**
-- Converts day-based features to years (age, employment duration, registration age, ID document age, phone change recency)
-- Creates age bins (18-25, 26-35, 36-45, 46-55, 56-65, 65+)
-- Creates employment tenure bins (0-1yr, 1-3yr, 3-5yr, 5-10yr, 10+yr)
+The strongest model in my workflow was the enhanced XGBoost model with supplementary POS and credit-card features.
 
-**3. Feature Engineering - Financial Ratios**
-- Core affordability metrics: credit-to-income, annuity-to-income, loan-to-value
-- Coverage metrics: payment rate, income-to-annuity, goods-price-to-income
-- Per-capita metrics: credit and income per family member
-- External score combinations: mean and weighted average
-- Risk indicators: high-risk income type flag, document submission count
+### 3. Business-oriented model documentation
 
-**4. Feature Engineering - Interactions**
-- Age × income interaction
-- Age × credit-to-income interaction
-- Employment × income interaction
-- External score × credit ratio interaction
-- Age squared for non-linear effects
+The model card goes beyond accuracy. It addresses:
 
-**5. Supplementary Data Aggregation**
-- **Bureau data (17 features):** Credit counts (active, closed, bad debt), total credit and debt amounts, overdue amounts and ratios, credit diversity metrics
-- **Previous applications (15 features):** Application counts by status, approval rate, credit and application amounts, down payment information, processing time
-- **Installment payments (8 features):** Late payment rates, days past due metrics, payment difference totals
+- who should use the model
+- what decision threshold is economically reasonable
+- how the model behaves using SHAP explanations
+- how technical features translate into adverse-action style reasons
+- where fairness gaps appear across demographic groups
+- what risks would need to be addressed before deployment
 
-**6. Train/Test Consistency Management**
-- Stores imputation values and feature names from training data
-- Applies identical transformations to test data using stored parameters
-- Ensures matching column sets between train and test datasets
+## Key Findings
 
-### How to Run
+- External credit features (`EXT_SOURCE_*`) remained the strongest predictors of default.
+- Affordability ratios such as credit-to-income and annuity-to-income added meaningful risk signal beyond raw amounts.
+- Supplementary behavioral data improved performance over application-only inputs.
+- Public leaderboard performance overstated final holdout performance slightly, which is a useful reminder not to overfit to leaderboard feedback.
+- Fairness review showed notable approval-rate differences across education groups, so the current model should be treated as decision support rather than a production auto-decline tool.
 
-The Quarto document can be rendered to HTML or used as a code source.
+## Interview Talking Points
 
-**Render the document:**
-```r
-# In RStudio/Positron, open data_preparation_sstrzalka.qmd and click "Render"
-# Or from command line:
-quarto render data_preparation_sstrzalka.qmd
-```
+If I were discussing this project in an interview, these are the parts I would emphasize:
 
-**Use as code source:**
-```r
-# Load data
-data <- load_all_data("Data")
+- I built a train/test-safe feature engineering pipeline rather than doing one-off notebook cleaning.
+- I compared simpler and more complex models instead of assuming gradient boosting would automatically win.
+- I translated model performance into business terms by selecting a threshold based on lending economics rather than defaulting to `0.50`.
+- I added explainability and fairness analysis because deployment quality is broader than AUC.
+- I documented model limitations and governance concerns in a model card written for a business stakeholder.
 
-# Prepare training data
-train_result <- prepare_data(
-  app_data = data$app_train,
-  bureau_data = data$bureau,
-  prev_app_data = data$prev_app,
-  install_data = data$installments,
-  is_train = TRUE
-)
+## Reproducibility
 
-# Prepare test data using training parameters
-test_result <- prepare_data(
-  app_data = data$app_test,
-  bureau_data = data$bureau,
-  prev_app_data = data$prev_app,
-  install_data = data$installments,
-  is_train = FALSE,
-  prep_params = train_result$params
-)
+### Data
 
-# Save prepared datasets
-save_prepared_data(train_result, test_result, output_dir = "prepared_data")
-```
+The raw Home Credit competition files are not committed because of size and licensing constraints. To run the notebooks locally:
 
-### Key Functions
+1. Download the Home Credit Default Risk data from Kaggle.
+2. Place the raw files in `Data/`.
+3. Render the notebooks in sequence or run the modeling and model card notebooks directly if prepared data already exist.
 
-| Function | Purpose |
-|----------|---------|
-| `prepare_data()` | Main pipeline orchestrating all preparation steps |
-| `clean_employment_anomaly()` | Handles DAYS_EMPLOYED = 365243 anomaly |
-| `impute_missing()` | Fills missing values with train-derived statistics |
-| `create_missing_indicators()` | Creates binary flags for missing values |
-| `engineer_demographic_features()` | Creates age, employment, and time-based features |
-| `engineer_financial_ratios()` | Creates affordability and risk ratios |
-| `engineer_interactions()` | Creates interaction terms between key predictors |
-| `aggregate_bureau_data()` | Summarizes credit bureau history |
-| `aggregate_previous_applications()` | Summarizes Home Credit application history |
-| `aggregate_installments()` | Calculates payment behavior metrics |
-| `load_all_data()` | Loads all CSV files |
-| `save_prepared_data()` | Saves prepared datasets and parameters |
+### Local-only artifacts
 
-### Inputs
+The repository ignores large or generated files such as:
 
-The pipeline requires the following CSV files in the `Data/` directory:
+- `Data/`
+- `prepared_data/`
+- `models/`
+- `*.csv`
+- rendered HTML outputs
 
-- `application_train.csv` - Training dataset with loan outcomes
-- `application_test.csv` - Test dataset without loan outcomes
-- `bureau.csv` - Credit bureau data
-- `previous_application.csv` - Previous Home Credit applications
-- `installments_payments.csv` - Payment history for previous loans
+This keeps GitHub focused on the code and documentation that make up the portfolio.
 
-### Outputs
+## Repository Structure
 
-The pipeline produces:
+| Path | Description |
+|---|---|
+| [README.md](./README.md) | Portfolio landing page and project summary |
+| [EDA_sstrzalka.qmd](./EDA_sstrzalka.qmd) | Exploratory analysis notebook |
+| [data_preparation_sstrzalka.qmd](./data_preparation_sstrzalka.qmd) | Data preparation notebook |
+| [modeling_sstrzalka.qmd](./modeling_sstrzalka.qmd) | Modeling notebook |
+| [model_card_sstrzalka.qmd](./model_card_sstrzalka.qmd) | Final model card |
+| `.gitignore` | Excludes data, artifacts, and generated outputs from version control |
 
-- `train_prepared.csv` - Cleaned and engineered training dataset (194 columns)
-- `test_prepared.csv` - Cleaned and engineered test dataset (193 columns, excluding TARGET)
-- `prep_params.rds` - Stored parameters for reproducibility (imputation values, feature names)
+## Tools
 
-### Important Notes
+Primary tools used in this project:
 
-**Data Leakage Prevention**
-- All statistics (means, medians, modes) are computed only from training data
-- Test data uses stored training parameters
-- Never fit on test data
+- `R`
+- `tidyverse`
+- `caret`
+- `xgboost`
+- `pROC`
+- `Quarto`
 
-**Column Consistency**
-- Script ensures train and test have identical columns except TARGET
-- Missing columns in test are added with value 0
-- Column order matches between datasets
+## Status
 
-## Dependencies
+This repository is complete as a course portfolio project. The next steps, if this were moving toward production, would be:
 
-```r
-library(tidyverse)
-```
-
-Install with: `install.packages("tidyverse")`
-
-## Data Files
-
-Data files are not tracked in this repository due to size constraints. To run this project:
-
-1. Download the Home Credit Default Risk dataset from Kaggle
-2. Place CSV files in the `Data/` directory
-3. Run the data preparation script
-
----
-
-*Last Updated: February 7, 2026*
+- retrain on the full prepared dataset
+- calibrate predicted probabilities
+- validate threshold assumptions against real portfolio economics
+- expand fairness testing and compliance review
+- separate ranking, pricing, and adverse-action workflows more explicitly
