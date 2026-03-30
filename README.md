@@ -4,14 +4,14 @@ Individual portfolio repository for my work on the Home Credit Default Risk proj
 
 This project asked a practical lending question: can we use alternative and behavioral data to predict default risk for applicants with limited traditional credit history? My work focused on building a reproducible feature pipeline, comparing candidate models, selecting a business operating threshold, and documenting the final model in a business-facing model card.
 
-## Business Summary
+## Business Problem and Project Objective
 
-Home Credit’s business challenge is balancing two competing goals:
+Home Credit's business challenge is balancing two competing goals:
 
-- Expand access to credit for thin-file borrowers.
-- Control losses from default.
+- expand access to credit for thin-file borrowers
+- control losses from default
 
-I approached this as a credit-risk ranking problem. The core output is a predicted probability of default for each applicant, which can be used to support approval decisions, manual review, and broader lending strategy.
+The project objective was to build a default-risk model that could help the business rank applicants, support approval decisions, and make lending tradeoffs more explicit. Rather than treating the assignment as a pure Kaggle exercise, I treated it as a credit-risk decision problem with business, explainability, and fairness implications.
 
 ## Final Result
 
@@ -23,9 +23,13 @@ I approached this as a credit-risk ranking problem. The core output is a predict
 
 At that operating threshold, the model card estimated:
 
-- Approval rate of `86.1%`
-- Recall of `42.7%` for defaults
-- Expected value of about `$776,256` per 1,000 screened applications under the public benchmark assumptions documented in the model card
+- approval rate of `86.1%`
+- recall of `42.7%` for defaults
+- expected value of about `$776,256` per 1,000 screened applications under the public benchmark assumptions documented in the model card
+
+## My Solution to the Business Problem
+
+My solution was to frame the problem as a default-risk ranking and thresholding workflow rather than a simple yes-or-no classifier. I built a feature-rich training dataset from application, bureau, prior loan, installment, POS cash, and credit-card data; compared several candidate models; selected the strongest XGBoost model; and translated the final score into a business recommendation using threshold analysis, explainability, and fairness review.
 
 ## Portfolio Notebooks
 
@@ -40,41 +44,37 @@ These notebooks represent my individual work product for the project.
 
 GitHub renders `.qmd` source files directly, so the repository keeps the code-first notebooks rather than relying on HTML outputs.
 
-## What I Built
+## Professional Use of Notebooks
 
-### 1. Reproducible feature engineering
+The notebooks are organized as a portfolio, not as scratch work. Each notebook has a distinct role in the project:
 
-I created a preparation workflow that:
+- `EDA_sstrzalka.qmd` establishes the business context, data patterns, and early hypotheses
+- `data_preparation_sstrzalka.qmd` documents a reproducible pipeline rather than one-off cleaning steps
+- `modeling_sstrzalka.qmd` shows baseline comparison, model tradeoffs, and selection logic
+- `model_card_sstrzalka.qmd` translates the final model into deployment-oriented language for a business stakeholder
 
-- cleaned the `DAYS_EMPLOYED = 365243` anomaly
-- imputed missing values using training-derived statistics
-- created missingness indicators
-- engineered affordability, stability, and interaction features
-- aggregated supplementary tables including bureau, previous applications, installments, POS cash, and credit card history
-- enforced train/test column consistency to reduce leakage risk
+Together, they show the full analytics lifecycle: exploration, preparation, modeling, and communication.
 
-### 2. Model comparison with a clear baseline
+## My Contribution
 
-I compared:
+This repository contains my individual work, not just a group deliverable. My contributions included:
 
-- majority-class and simple logistic baselines
-- logistic regression on baseline, application-only, and full feature sets
-- random forest
-- XGBoost
-- class-imbalance strategies including downsampling, upsampling, and SMOTE
+- exploratory data analysis to identify early default signals and missing-data patterns
+- a reproducible feature-engineering pipeline that preserves train/test separation
+- model comparison across logistic regression, random forest, and XGBoost
+- supplementary feature construction from multiple transactional tables
+- a model card that translated technical results into business language, threshold decisions, SHAP explanations, and fairness findings
 
-The strongest model in my workflow was the enhanced XGBoost model with supplementary POS and credit-card features.
+## Business Value of the Solution
 
-### 3. Business-oriented model documentation
+The business value is not just that the model predicts defaults better than a baseline. The stronger value is that it gives a lender a structured way to:
 
-The model card goes beyond accuracy. It addresses:
+- expand credit more confidently to applicants with thin traditional credit files
+- quantify the tradeoff between approval volume and expected losses
+- explain why a model is making higher-risk predictions
+- surface fairness and governance issues before deployment
 
-- who should use the model
-- what decision threshold is economically reasonable
-- how the model behaves using SHAP explanations
-- how technical features translate into adverse-action style reasons
-- where fairness gaps appear across demographic groups
-- what risks would need to be addressed before deployment
+That makes the work more useful to a real lending organization than a leaderboard score alone.
 
 ## Key Findings
 
@@ -83,6 +83,26 @@ The model card goes beyond accuracy. It addresses:
 - Supplementary behavioral data improved performance over application-only inputs.
 - Public leaderboard performance overstated final holdout performance slightly, which is a useful reminder not to overfit to leaderboard feedback.
 - Fairness review showed notable approval-rate differences across education groups, so the current model should be treated as decision support rather than a production auto-decline tool.
+
+## Project Difficulties
+
+The most important difficulties in the project were:
+
+- severe class imbalance, which made accuracy misleading and required threshold and recall-focused analysis
+- extensive missingness and anomaly handling, especially around employment and sparse bureau-style variables
+- joining multiple supplementary tables without creating leakage or train/test mismatch
+- balancing leaderboard performance against a model that would still be explainable and defensible in a lending context
+- translating technical model outputs into language appropriate for business stakeholders and adverse-action style reasoning
+
+## What I Learned
+
+This project pushed me beyond just fitting a model. The main things I learned were:
+
+- strong portfolio work needs reproducibility, not just a final score
+- good credit-risk modeling requires careful feature engineering and threshold design, not only algorithm selection
+- public leaderboard results can be optimistic, so validation discipline matters
+- explainability and fairness analysis are part of model quality when the use case affects real people
+- a professional analytics portfolio should communicate business impact, tradeoffs, and limitations clearly
 
 ## Interview Talking Points
 
